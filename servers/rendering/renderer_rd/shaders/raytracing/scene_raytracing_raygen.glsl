@@ -66,9 +66,13 @@ void main() {
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
 			path_pack(payload, ps);
 
+			// Primary rays see CAMERA instances, bounce rays see INDIRECT --
+			// this is what makes cast_shadow Off / Shadows Only work.
+			uint cull_mask = (bounce == 0u) ? RT_MASK_CAMERA : RT_MASK_INDIRECT;
+
 #ifdef USE_SER
 			hitObjectEXT hitObject;
-			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, cull_mask, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 
 			// Reorder with a coherence hint that has 8 bits
 			uint hint = 0;
@@ -80,7 +84,7 @@ void main() {
 
 			hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-			traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+			traceRayEXT(tlas, RT_RAY_FLAGS, cull_mask, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 #endif
 
 			ps = path_unpack(payload);

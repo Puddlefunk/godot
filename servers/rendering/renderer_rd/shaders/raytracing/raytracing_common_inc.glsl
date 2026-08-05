@@ -19,6 +19,14 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
 
+// traceRayEXT cullMask values -- ray-type participation.
+// Visibility = instance.mask & cullMask; the instance side is built in
+// render_raytracing.cpp from GeometryInstance3D.cast_shadow.
+// MUST match RT_INSTANCE_MASK_* in render_raytracing.h.
+#define RT_MASK_CAMERA 0x01u
+#define RT_MASK_SHADOW 0x02u
+#define RT_MASK_INDIRECT 0x04u
+
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;
 	SceneData prev_data;

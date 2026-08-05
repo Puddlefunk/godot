@@ -2350,6 +2350,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool transform_moved;
 		RTMaterialData *mat_data;
 		uint32_t inst_flags;
+		uint32_t inst_mask;
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -2435,7 +2436,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(rt_instance_mask_from_cast_shadows(inst->data->cast_shadows_setting));
 			}
 			continue;
 		}
@@ -2550,6 +2551,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
+				pending.inst_mask = rt_instance_mask_from_cast_shadows(inst->data->cast_shadows_setting);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -2726,7 +2728,10 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT;
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(0xFF);
+			// Ray-type participation from GeometryInstance3D.cast_shadow.
+			// Off = no SHADOW bit; Shadows Only = SHADOW bit alone, i.e.
+			// invisible to camera and bounce rays.
+			instance_masks.push_back(rt_instance_mask_from_cast_shadows(inst->data->cast_shadows_setting));
 
 			surf = surf->next;
 		}
@@ -2756,7 +2761,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(pending.inst_mask);
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -2827,7 +2832,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(pending.inst_mask);
 			}
 
 #ifdef TOOLS_ENABLED

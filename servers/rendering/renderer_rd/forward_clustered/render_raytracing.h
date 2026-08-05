@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
+#include "servers/rendering/rendering_server_enums.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
@@ -182,6 +183,34 @@ enum {
 	// Set when the BLAS uses a per-frame-deformed vertex buffer.
 	RT_GEOM_FLAG_DEFORMED = 4u,
 };
+
+// Per-instance TLAS mask bits -- ray-type participation.
+// Visibility = instance.mask & traceRayEXT cullMask.
+// MUST match RT_MASK_* in shaders/raytracing/raytracing_common_inc.glsl.
+// The remaining 5 bits are reserved (e.g. GI blockers, debug exclusion).
+enum {
+	RT_INSTANCE_MASK_CAMERA = 0x01u, // primary rays (bounce 0)
+	RT_INSTANCE_MASK_SHADOW = 0x02u, // NEE / shadow rays
+	RT_INSTANCE_MASK_INDIRECT = 0x04u, // bounce rays (bounce > 0)
+	RT_INSTANCE_MASK_ALL = 0x07u,
+};
+
+// Maps GeometryInstance3D.cast_shadow to mask bits. Raster parity:
+// SHADOWS_ONLY is absent from reflections/GI too, so it gets SHADOW alone.
+// DOUBLE_SIDED is a geometry concern (handled via cast_double_sided_shadows
+// plumbing), not a participation concern — same mask as ON.
+inline uint32_t rt_instance_mask_from_cast_shadows(RSE::ShadowCastingSetting p_setting) {
+	switch (p_setting) {
+		case RSE::SHADOW_CASTING_SETTING_OFF:
+			return RT_INSTANCE_MASK_CAMERA | RT_INSTANCE_MASK_INDIRECT;
+		case RSE::SHADOW_CASTING_SETTING_SHADOWS_ONLY:
+			return RT_INSTANCE_MASK_SHADOW;
+		case RSE::SHADOW_CASTING_SETTING_ON:
+		case RSE::SHADOW_CASTING_SETTING_DOUBLE_SIDED:
+		default:
+			return RT_INSTANCE_MASK_ALL;
+	}
+}
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
