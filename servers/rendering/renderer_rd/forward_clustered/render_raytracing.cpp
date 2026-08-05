@@ -2529,6 +2529,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 					}
 				}
+				// See the identical block in the regular-surface path below:
+				// transmissive instances must run the any-hit for shadow
+				// attenuation.
+				if (mat_data->data.transmission > 0.0f) {
+					inst_flags &= ~uint32_t(RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT);
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT;
+				}
 
 				PendingMMSurface pending;
 				pending.mm_rid = mm_rid;
@@ -2708,6 +2715,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				if (!is_alpha) {
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
+			}
+
+			// Transmissive shadow attenuation lives in the any-hit, so it must
+			// RUN for transmissive instances: strip any FORCE_OPAQUE decided
+			// above and force NO-opaque, which also overrides BLAS-level opaque
+			// geometry flags. Must stay after the opacity decisions above.
+			if (mat_data->data.transmission > 0.0f) {
+				inst_flags &= ~uint32_t(RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT);
+				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT;
 			}
 			instance_flags.push_back(inst_flags);
 			instance_masks.push_back(0xFF);

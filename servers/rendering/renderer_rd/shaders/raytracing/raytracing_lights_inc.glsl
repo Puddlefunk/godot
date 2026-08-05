@@ -185,10 +185,27 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 // Shadow Ray (traceRayEXT pipeline)
 // ============================================================================
 
-/// Returns true if light is visible.
-/// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
-/// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
+/// Returns per-channel light transmittance along the shadow ray:
+/// vec3(1) = fully visible, vec3(0) = occluded by opaque geometry, and in
+/// between = Beer-Lambert attenuation through transmissive contract media.
+/// Shadow rays stay STRAIGHT -- no refraction, no caustics; the standard PT
+/// shadow contract.
+///
+/// Uses SkipClosestHitShader so only any_hit and miss are invoked.
+/// TerminateOnFirstHit still early-exits on the first confirmed OPAQUE hit;
+/// transmissive hits are ignored by the any-hit (traversal continues) after
+/// accumulating signed optical depth into the payload's three non-radiance
+/// 32-bit slots (hit_t = R; the two oct slots reinterpreted as raw fp32 = G, B).
+/// Signed: +sigma*t at back faces, -sigma*t at front faces, so the sum equals
+/// sigma * total interior length regardless of the (unordered) any-hit
+/// invocation order. fp32 on purpose -- fp16 payload channels clamp and lose
+/// the log-domain range.
+///
+/// USE_RAY_QUERY_SHADOWS returns binary visibility only. Inline ray queries
+/// never invoke the any-hit shader, so there is no hook to accumulate optical
+/// depth; transmissive media cast fully opaque shadows on that path, alongside
+/// its existing inability to handle complex alpha materials.
+vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
 #ifdef USE_RAY_QUERY_SHADOWS
 	// Ray queries are significantly faster, but can not handle complex alpha materials
 	rayQueryEXT shadow_rq;
@@ -209,19 +226,13 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 		}
 	}
 
-	return rayQueryGetIntersectionTypeEXT(shadow_rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
-#elif defined(USE_SER)
-	hitObjectEXT hitObject;
-	hitObjectTraceRayEXT(hitObject, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
-			origin, 0.001, direction, max_dist - 0.001, 0);
-
-	return !(hitObjectIsHitEXT(hitObject));
+	return (rayQueryGetIntersectionTypeEXT(shadow_rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+			? vec3(1.0)
+			: vec3(0.0);
 #else
-	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
-	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
 	// Save full payload, set up shadow ray, then restore after trace.
+	// (The SER path now also uses the payload for the accumulator and the
+	// any-hit's is_shadow_ray check, so both paths save/init/restore.)
 	PathPayload saved_payload = payload;
 
 	PathState shadow_ps;
@@ -233,19 +244,45 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
 	path_pack(payload, shadow_ps);
+	// Zero the accumulator AFTER path_pack -- it just seeded the oct slots with
+	// encoded normals, and those bits must start as fp32 zero.
+	payload.hit_t = 0.0;
+	payload.oct_offset_nrm = floatBitsToUint(0.0);
+	payload.oct_next_dir = floatBitsToUint(0.0);
 
+#ifdef USE_SER
+	hitObjectEXT hitObject;
+	hitObjectTraceRayEXT(hitObject, tlas,
+			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			0xFF, 0, 0, 0,
+			origin, 0.001, direction, max_dist - 0.001, 0);
+
+	bool visible = !(hitObjectIsHitEXT(hitObject));
+#else
+	/// The miss shader writes radiance.x = 1.0 for shadow rays (visible).
+	/// If an opaque hit occurs, miss is never called and radiance stays 0.
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
 			0xFF, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
-	// Unpack to check visibility (miss shader packs radiance = 1.0).
-	shadow_ps = path_unpack(payload);
-	bool visible = shadow_ps.radiance.x > 0.5;
+	bool visible = unpackHalf2x16(payload.packed_rt[0]).x > 0.5;
+#endif
+
+	vec3 optical_depth = vec3(
+			payload.hit_t,
+			uintBitsToFloat(payload.oct_offset_nrm),
+			uintBitsToFloat(payload.oct_next_dir));
 
 	payload = saved_payload;
 
-	return visible;
+	if (!visible) {
+		return vec3(0.0);
+	}
+	// Negative net depth appears when the ray STARTS inside a medium (its entry
+	// face is behind the origin, so the pair is unbalanced) -- clamp to the
+	// physical range instead of amplifying.
+	return exp(-max(optical_depth, vec3(0.0)));
 #endif
 }
 
@@ -345,7 +382,9 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
+		// Per-channel transmittance, not a binary visibility test.
+		vec3 shadow_transmittance = lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state);
+		if (all(lessThan(shadow_transmittance, vec3(0.0001)))) {
 			return vec3(0.0);
 		}
 
@@ -364,7 +403,7 @@ vec3 lights_evaluate_direct_lighting(
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
+		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * shadow_transmittance;
 		return contribution / max(light_select_pdf, 1e-10);
 	}
 	// === CONE LIGHT PATH (directional) ===
@@ -378,7 +417,9 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
+		// Per-channel transmittance, not a binary visibility test.
+		vec3 shadow_transmittance = lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state);
+		if (all(lessThan(shadow_transmittance, vec3(0.0001)))) {
 			return vec3(0.0);
 		}
 
@@ -390,6 +431,6 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * indirect_mul * shadow_transmittance / max(light_select_pdf, 1e-10);
 	}
 }

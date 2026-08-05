@@ -156,9 +156,12 @@ void main() {
 
 #if !defined(USE_SER)
 	// Shadow rays that miss mean the light is visible (no occluder).
+	// Write ONLY the radiance halves. A full path_pack here would round-trip
+	// hit_t and the two oct slots -- which shadow rays now use as a raw-fp32
+	// Beer-Lambert accumulator, see the any-hit -- through octahedral encoding
+	// and destroy them.
 	if (is_shadow_ray(ps.packed_bounces_flags)) {
-		ps.radiance = vec3(1.0);
-		path_pack(payload, ps);
+		payload.packed_rt[0] = packHalf2x16(vec2(1.0, 1.0));
 		return;
 	}
 #endif
@@ -557,8 +560,32 @@ void main() {
 	}
 #else
 	// HG0: Standard material alpha test.
-	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	MaterialData mat = materials[geometry_idx];
+
+	// Transmissive contract materials. Shadow rays accumulate signed
+	// Beer-Lambert optical depth and pass through (ignore) -- only opaque
+	// geometry occludes. Signed accumulation: +sigma*t at back faces, -sigma*t
+	// at front faces sums to sigma * interior chord length no matter what order
+	// traversal reports the faces in. The payload's three non-radiance 32-bit
+	// slots carry the fp32 accumulator (hit_t = R, the two oct slots
+	// reinterpreted as raw float bits = G, B) -- see lights_trace_shadow_ray,
+	// which zeroes them before the trace and applies exp(-depth) after.
+	// Camera/bounce rays fall through to the normal accept path; the
+	// closest-hit transmission lobe handles them.
+	// Known gap: custom shaders using BOTH alpha clip and transmission run
+	// their per-hit-group any-hit instead and skip this path.
+	if (mat.transmission > 0.0) {
+		if (is_shadow_ray(payload.packed_bounces_flags)) {
+			float sgn = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT) ? -1.0 : 1.0;
+			float st = sgn * gl_HitTEXT;
+			payload.hit_t += st * mat.absorption_r;
+			payload.oct_offset_nrm = floatBitsToUint(uintBitsToFloat(payload.oct_offset_nrm) + st * mat.absorption_g);
+			payload.oct_next_dir = floatBitsToUint(uintBitsToFloat(payload.oct_next_dir) + st * mat.absorption_b);
+			ignoreIntersectionEXT;
+		}
+	}
+
+	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
 	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
 	alpha *= mat.albedo_color.a;
