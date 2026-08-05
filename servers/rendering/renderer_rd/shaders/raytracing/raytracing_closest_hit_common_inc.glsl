@@ -108,6 +108,76 @@ vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_dep
 }
 
 // ============================================================================
+// UV1 TRIPLANAR (StandardMaterial3D parity under PT)
+// ============================================================================
+// Raster triplanar lives in BaseMaterial3D's GENERATED shader code, which the
+// PT hit path never runs — so PT reimplements the same math from the record:
+// weights = pow(abs(N), sharpness)/sum, pos = P * uv1_scale + uv1_offset then
+// pos *= (1,-1,1), samples xy*w.z + xz*w.y + zy*(-1,1)*w.x (material.cpp
+// ~1391-1473 is the reference). Object mode uses MODEL space: for compressed
+// meshes BLAS object space is the unit-cube compression space, so positions
+// go through aabb_xform and normals through the model matrix transpose
+// (same construction as read_model_matrix in the custom-fragment path).
+
+struct TriplanarCoords {
+	vec3 weights;
+	vec3 pos;
+	vec3 tangent; // World-space axis-aligned frame for normal mapping,
+	vec3 binormal; // matching raster's generated TANGENT/BINORMAL.
+};
+
+TriplanarCoords compute_triplanar_coords(HitData h, MaterialData mat, GeometryData geom) {
+	TriplanarCoords tc;
+	bool world_mode = (mat.flags & 16u) != 0u;
+	vec3 n; // Blend-space normal (world or model).
+	vec3 p; // Blend-space position.
+	mat4 model = mat4(1.0);
+	if (world_mode) {
+		n = h.geometry_normal;
+		p = h.hit_pos;
+	} else {
+		mat4 aabb_xform, inv_aabb_xform;
+		get_aabb_compression_xforms(geom, aabb_xform, inv_aabb_xform);
+		model = mat4(gl_ObjectToWorldEXT) * inv_aabb_xform;
+		// n_model = transpose(M) * n_world (inverse of the inverse-transpose).
+		n = normalize((vec4(h.geometry_normal, 0.0) * model).xyz);
+		p = (aabb_xform * vec4(gl_ObjectRayOriginEXT + gl_HitTEXT * gl_ObjectRayDirectionEXT, 1.0)).xyz;
+	}
+
+	tc.weights = pow(abs(n), vec3(mat.triplanar_sharpness));
+	tc.weights /= dot(tc.weights, vec3(1.0));
+
+	p = p * vec3(mat.uv1_scale, mat.uv1_scale_z) + vec3(mat.uv1_offset, mat.uv1_offset_z);
+	tc.pos = p * vec3(1.0, -1.0, 1.0);
+
+	// Raster's axis-aligned triplanar frame (material.cpp ~1369-1388),
+	// brought to world space for object mode.
+	vec3 t = vec3(0.0, 0.0, -1.0) * abs(n.x) + vec3(1.0, 0.0, 0.0) * abs(n.y) + vec3(1.0, 0.0, 0.0) * abs(n.z);
+	vec3 b = vec3(0.0, 1.0, 0.0) * abs(n.x) + vec3(0.0, 0.0, -1.0) * abs(n.y) + vec3(0.0, 1.0, 0.0) * abs(n.z);
+	if (!world_mode) {
+		t = mat3(model) * t;
+		b = mat3(model) * b;
+	}
+	tc.tangent = normalize(t);
+	tc.binormal = normalize(b);
+	return tc;
+}
+
+vec4 sample_material_texture_triplanar(uint tex_idx, TriplanarCoords tc, uint mat_flags) {
+	vec4 samp = vec4(0.0);
+	samp += sample_material_texture(tex_idx, tc.pos.xy, mat_flags) * tc.weights.z;
+	samp += sample_material_texture(tex_idx, tc.pos.xz, mat_flags) * tc.weights.y;
+	samp += sample_material_texture(tex_idx, tc.pos.zy * vec2(-1.0, 1.0), mat_flags) * tc.weights.x;
+	return samp;
+}
+
+/// Normal mapping over the triplanar frame instead of mesh tangents.
+vec3 apply_normal_map_triplanar(HitData h, TriplanarCoords tc, vec3 tangent_space_normal, float normal_map_depth) {
+	vec3 mapped = tc.tangent * tangent_space_normal.x + tc.binormal * tangent_space_normal.y + h.geometry_normal * tangent_space_normal.z;
+	return normalize(mix(h.geometry_normal, mapped, normal_map_depth));
+}
+
+// ============================================================================
 // DEPTH WRITE (primary ray only)
 // ============================================================================
 

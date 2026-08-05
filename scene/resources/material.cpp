@@ -2465,6 +2465,17 @@ void BaseMaterial3D::set_flag(Flags p_flag, bool p_enabled) {
 
 	flags[p_flag] = p_enabled;
 
+	// The pathtracer's material snapshot reads state by name via
+	// material_get_param, but triplanar is a shader-code feature rather than a
+	// uniform, so it never reached the params table. Push it explicitly so the
+	// RT record can honour it. Raster is unaffected: params the shader does not
+	// declare are ignored by uniform packing.
+	if (p_flag == FLAG_UV1_USE_TRIPLANAR) {
+		_material_set_param(SNAME("uv1_triplanar"), p_enabled);
+	} else if (p_flag == FLAG_UV1_USE_WORLD_TRIPLANAR) {
+		_material_set_param(SNAME("uv1_world_triplanar"), p_enabled);
+	}
+
 	if (
 			p_flag == FLAG_USE_SHADOW_TO_OPACITY ||
 			p_flag == FLAG_USE_TEXTURE_REPEAT ||

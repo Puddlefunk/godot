@@ -120,7 +120,12 @@ struct alignas(16) RT_MaterialData {
 	float transmission; // pt_transmission: 0 = opaque, 1 = full delta dielectric.
 	float ior; // pt_ior: index of refraction (default 1.5).
 	float absorption_sigma[3]; // Beer-Lambert sigma/m per channel, precomputed from pt_absorption (linear tint) + pt_absorption_distance.
-	float _pad[3];
+	// uv1 triplanar. Takes the former padding, so the struct size is unchanged.
+	// uv1_scale/offset above are vec2 -- triplanar additionally needs the z of
+	// Godot's Vector3 params, carried here.
+	float triplanar_sharpness; // uv1_blend_sharpness (default 1.0).
+	float uv1_scale_z;
+	float uv1_offset_z;
 };
 static_assert(sizeof(RT_MaterialData) == 128, "RT_MaterialData must be 128 bytes for std430");
 
@@ -168,6 +173,9 @@ enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
 	RT_MAT_FLAG_POINT_FILTER = 4u,
+	// uv1 triplanar mapping under PT.
+	RT_MAT_FLAG_TRIPLANAR = 8u,
+	RT_MAT_FLAG_TRIPLANAR_WORLD = 16u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

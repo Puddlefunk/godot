@@ -112,7 +112,9 @@ struct MaterialData {
 	float absorption_r; // Beer-Lambert sigma/m per channel.
 	float absorption_g;
 	float absorption_b;
-	float _pad0;
-	float _pad1;
-	float _pad2;
+	// uv1 triplanar (former padding; struct size unchanged).
+	// Flag bits 8 (triplanar) / 16 (world triplanar) in `flags` gate use.
+	float triplanar_sharpness;
+	float uv1_scale_z; // z of Godot's Vector3 uv1_scale (xy above).
+	float uv1_offset_z;
 };
