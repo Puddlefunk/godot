@@ -1713,6 +1713,16 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.emission_strength = emission_energy_var;
 	}
 
+	// The hit shader gates all emission evaluation on RT_MAT_FLAG_HAS_EMISSION_TEX,
+	// which was only set for materials with an emission texture -- texture-less
+	// emissive materials contributed nothing under PT. Bindless slot 0 is the
+	// default white texture, so setting the flag yields
+	// white * emission_color * emission_strength.
+	if (mat.emission_strength != 0.0f &&
+			(mat.emission_color[0] != 0.0f || mat.emission_color[1] != 0.0f || mat.emission_color[2] != 0.0f)) {
+		mat.flags |= RT_MAT_FLAG_HAS_EMISSION_TEX;
+	}
+
 	// UV1 scale and offset (vec3 in Godot, we only use xy).
 	Variant uv1_scale_var = material_storage->material_get_param(p_material_rid, "uv1_scale");
 	if (uv1_scale_var.get_type() == Variant::VECTOR3) {
