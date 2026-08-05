@@ -201,7 +201,13 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 			ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
 		}
 
-		if ((ubo.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP) || (ubo.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP)) {
+		// The pathtracer's miss shader and fog sampling read radiance_inverse_xform
+		// unconditionally, but this UBO is memset to zero and the transform was
+		// previously only written under the ambient/reflection cubemap flags. With
+		// both sources disabled the PT sky collapsed to a single texel. Write it
+		// whenever an environment exists -- it is cheap, and raster shaders read it
+		// only under the same flags as before.
+		{
 			Basis sky_transform = render_scene_render->environment_get_sky_orientation(p_env);
 			sky_transform = sky_transform.inverse() * cam_transform.basis;
 			RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);
