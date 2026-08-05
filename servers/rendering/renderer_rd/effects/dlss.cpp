@@ -56,6 +56,9 @@ public:
 	sl::DLSSOptions currentDlssOptions;
 	sl::DLSSOptimalSettings currentOptimalSettings;
 	sl::DLSSDOptions currentDlssDOptions; // DLSS Ray Reconstruction options
+	// Frame index of the last slSetConstants for this viewport -- Streamline
+	// expects constants ONCE per (frame token, viewport).
+	uint32_t constants_set_frame = UINT32_MAX;
 
 	DLSSContextInner();
 	virtual ~DLSSContextInner();
@@ -416,7 +419,14 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 	}
 
 	// Set SL Options
-	if (StreamlineContext::get().slSetConstants != nullptr) {
+	// Coalesced per frame token. Anything that re-enters the upscale for the
+	// same frame -- redundant caller-side pushes, viewport re-renders --
+	// previously re-sent the same-frame constants and flooded the log with
+	// Streamline duplicate-constants warnings. Within one frame token the
+	// constants are identical by construction (same camera, same jitter), so
+	// the repeat call carries no information.
+	if (StreamlineContext::get().slSetConstants != nullptr &&
+			context->constants_set_frame != (uint32_t)(*StreamlineContext::get().last_token)) {
 		sl::float4x4 mtxIdentity = sl_make_identity_matrix();
 		context->constants.cameraViewToClip = sl_convert_matrix(p_params.cam_projection); // projection mtx (unjittered)
 		context->constants.clipToCameraView = sl_convert_matrix(p_params.cam_projection.inverse()); // projection mtx (unjittered, inverted)
@@ -447,6 +457,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		if (result != sl::Result::eOk) {
 			ERR_FAIL_MSG("Failed to call streamline slSetConstants. Result: " + String(StreamlineContext::result_to_string(result)));
 		}
+		context->constants_set_frame = (uint32_t)(*StreamlineContext::get().last_token);
 	}
 
 	// Tag resources
