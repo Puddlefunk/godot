@@ -94,7 +94,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 96 bytes).
+// Must match GLSL MaterialData (std430, 128 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -112,8 +112,16 @@ struct alignas(16) RT_MaterialData {
 	float normal_map_depth; // Strength [0..N], default 1.0 (not Z-depth).
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none).
+	// Pathtracer material contract. These are first-class path-tracer inputs
+	// snapshotted by name from declared pt_* shader uniforms, never inferred
+	// from raster-era channels. Declaring the uniform is the opt-in; unset
+	// params fall back to the shader's declared defaults.
+	float transmission; // pt_transmission: 0 = opaque, 1 = full delta dielectric.
+	float ior; // pt_ior: index of refraction (default 1.5).
+	float absorption_sigma[3]; // Beer-Lambert sigma/m per channel, precomputed from pt_absorption (linear tint) + pt_absorption_distance.
+	float _pad[3];
 };
-static_assert(sizeof(RT_MaterialData) == 96, "RT_MaterialData must be 96 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 128, "RT_MaterialData must be 128 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {

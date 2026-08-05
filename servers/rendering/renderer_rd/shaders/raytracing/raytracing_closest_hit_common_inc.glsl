@@ -396,6 +396,7 @@ void debug_visualize(
 		dbg_mat.dielectricF0 = specular_to_f0(specular);
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = 0.0;
+		dbg_mat.eta = 1.0;
 		dbg_mat.opacity = 1.0;
 
 		vec3 dbg_dir;
@@ -455,6 +456,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
+	// Pathtracer material contract, snapshotted from declared pt_* uniforms by
+	// render_raytracing.cpp (read by name -- never inferred from raster channels).
+	MaterialData contract_md = materials[h.geometry_idx];
+
+	// Beer-Lambert absorption. If we are exiting a transmissive
+	// medium through its back face, the segment just traversed was INSIDE it
+	// (convex bodies; nested media out of scope) — attenuate over gl_HitTEXT
+	// meters with the precomputed sigma. Before the emissive add, so anything
+	// seen at or beyond this surface is tinted by the interior.
+	if (contract_md.transmission > 0.0 && !h.is_front_face) {
+		vec3 sigma = vec3(contract_md.absorption_r, contract_md.absorption_g, contract_md.absorption_b);
+		ps.throughput *= exp(-sigma * gl_HitTEXT);
+	}
+
 	// Emissive contribution.
 	ps.radiance += ps.throughput * m.emissive;
 
@@ -474,6 +489,18 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.emissive = m.emissive;
 	brdf_mat.transmissivness = 0.0;
 	brdf_mat.opacity = 1.0;
+	brdf_mat.eta = 1.0;
+
+	// Consume the transmission contract.
+	brdf_mat.transmissivness = contract_md.transmission;
+	if (contract_md.transmission > 0.0) {
+		// Delta lobes only, no rough refraction -- force the record smooth so
+		// the guides and the lobe agree.
+		brdf_mat.roughness = 0.0;
+		// Relative IOR for THIS hit: entering through the front face vs.
+		// exiting through the back.
+		brdf_mat.eta = h.is_front_face ? (1.0 / contract_md.ior) : contract_md.ior;
+	}
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
@@ -485,7 +512,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
-		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness));
+		// The demodulation guides read the resolved PT material record rather than
+		// the raw raster channels. These agree for ordinary surfaces, but diverge
+		// wherever the record is overridden -- notably transmissive materials,
+		// whose shading record is not the raster albedo.
+		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(brdf_mat.baseColor, brdf_mat.metalness));
 
 		// Emissive surfaces must carry their emission in the demodulation guide:
 		// Ray Reconstruction smooths the demodulated signal as if it were lighting,
@@ -498,14 +529,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
-		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
+		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0, brdf_mat.roughness, NdotV);
 		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.04), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
 
-		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
+		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, brdf_mat.roughness));
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
-		if (m.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
+		if (brdf_mat.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
 			vec3 spec_dir = reflect(-V, N);
 			vec3 spec_origin = offset_ray_origin(h.hit_pos, spec_dir);
 
@@ -536,7 +567,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	path_pack(payload, ps);
 
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	if (rt_light_count > 0u) {
+	// Delta transmission has zero BRDF value in any NEE-sampled light direction,
+	// so skip direct light sampling entirely on transmissive hits.
+	if (rt_light_count > 0u && brdf_mat.transmissivness == 0.0) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
@@ -551,7 +584,13 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	float diffuseLum = luminance(diffuseReflectance);
 
 	int brdfType;
-	if (diffuseLum < 0.0001) {
+	if (brdf_mat.transmissivness > 0.0) {
+		// Transmissive surface: the two-way split becomes three-way. For a full
+		// delta dielectric the Fresnel reflect/refract choice lives INSIDE the
+		// lobe, so there is no selection probability to divide out here.
+		// Partial transmission mixing diffuse/specular is not handled yet.
+		brdfType = TRANSMISSION_TYPE;
+	} else if (diffuseLum < 0.0001) {
 		brdfType = SPECULAR_TYPE;
 	} else if (specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
@@ -577,7 +616,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		//      mirror is gated by RT_BELOW_HEMISPHERE_RECOVERY_ENABLED; when
 		//      disabled, recovery returns false and we terminate the path.
 		vec3 recovered_dir;
-		if (luminance(brdf_weight) == 0.0 ||
+		// Never mirror-recover a transmission sample: mirroring a refracted
+		// direction back above the plane is exactly the "glass becomes a mirror"
+		// failure. Terminate instead. This can only happen on a zero-weight
+		// sample; the lobe itself never fails the plane check.
+		if (brdfType == TRANSMISSION_TYPE ||
+				luminance(brdf_weight) == 0.0 ||
 				!recoverBelowHemisphereSample(next_dir, h.geometry_normal, recovered_dir)) {
 			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 			path_pack(payload, ps);
@@ -597,7 +641,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.
 	ps.hit_t = gl_HitTEXT;
-	ps.offset_normal = h.geometry_normal;
+	// Transmitted rays continue on the FAR side of the surface -- the
+	// origin offset must push below the geometry plane, or the continuation
+	// ray self-intersects the interface it just refracted through.
+	ps.offset_normal = (dot(next_dir, h.geometry_normal) >= 0.0)
+			? h.geometry_normal
+			: -h.geometry_normal;
 	ps.next_ray_dir = next_dir;
 	path_pack(payload, ps);
 }

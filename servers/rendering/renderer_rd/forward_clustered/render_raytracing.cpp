@@ -1463,6 +1463,14 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_offset[1] = 0.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.transmission = 0.0f;
+	mat.ior = 1.5f;
+	mat.absorption_sigma[0] = 0.0f;
+	mat.absorption_sigma[1] = 0.0f;
+	mat.absorption_sigma[2] = 0.0f;
+	mat._pad[0] = 0.0f;
+	mat._pad[1] = 0.0f;
+	mat._pad[2] = 0.0f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1523,6 +1531,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// Material properties
 	// Colors declared with source_color in Godot shaders are stored in sRGB;
 	// material_get_param returns the raw sRGB value, so we convert to linear here.
+	// Kept in scope past the custom-shader block so the pt_* contract reads
+	// below can fall back to declared uniform defaults.
+	const SceneShaderRaytracing::CustomShaderEntry *pt_contract_cse = nullptr;
 	Variant albedo_var = material_storage->material_get_param(p_material_rid, "albedo");
 	if (albedo_var.get_type() == Variant::COLOR) {
 		Color c = ((Color)albedo_var).srgb_to_linear();
@@ -1539,6 +1550,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 		const SceneShaderRaytracing::CustomShaderEntry *cse =
 				SceneShaderRaytracing::get_singleton()->get_custom_shader_entry(mat_data->rt_sbt_offset);
+		pt_contract_cse = cse;
 		if (cse && cse->uniform_total_size > 0) {
 			Vector<uint8_t> ubo_data;
 			ubo_data.resize(cse->uniform_total_size);
@@ -1682,6 +1694,57 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				RD::get_singleton()->set_resource_name(mat_data->uniform_buffer, String("RT Material UBO [sbt=") + itos(mat_data->rt_sbt_offset) + "]");
 				mat.uniform_address = RD::get_singleton()->buffer_get_device_address(mat_data->uniform_buffer);
 			}
+		}
+	}
+
+	// Pathtracer material contract. pt_transmission, pt_ior, pt_absorption
+	// (LINEAR transmitted tint) and pt_absorption_distance are read by name --
+	// declaring them in a shader is the opt-in, and unset params fall back to
+	// the declared defaults, matching the semantics pack_uniform gives the
+	// custom UBO. Inference from raster channels is deliberately absent: any
+	// future StandardMaterial3D mapping belongs in a separate adapter.
+	{
+		auto get_pt_float = [&](const StringName &p_name, float p_fallback) -> float {
+			Variant v = material_storage->material_get_param(p_material_rid, p_name);
+			if (v.get_type() == Variant::FLOAT || v.get_type() == Variant::INT) {
+				return (float)(double)v;
+			}
+			if (pt_contract_cse) {
+				const ShaderLanguage::ShaderNode::Uniform *u = pt_contract_cse->uniforms.getptr(p_name);
+				if (u && u->type == ShaderLanguage::TYPE_FLOAT) {
+					return _def_real(*u, 0);
+				}
+			}
+			return p_fallback;
+		};
+
+		Variant tv = material_storage->material_get_param(p_material_rid, "pt_transmission");
+		bool opts_in = (tv.get_type() == Variant::FLOAT || tv.get_type() == Variant::INT) ||
+				(pt_contract_cse && pt_contract_cse->uniforms.has("pt_transmission"));
+		if (opts_in) {
+			mat.transmission = CLAMP(get_pt_float("pt_transmission", 0.0f), 0.0f, 1.0f);
+			mat.ior = CLAMP(get_pt_float("pt_ior", 1.5f), 1.0001f, 4.0f);
+
+			// Beer-Lambert: authors give the surviving tint after `distance`
+			// meters; the shader wants sigma/m. Precompute here so the hit
+			// shader pays one exp(), not a log and a divide.
+			Color tint(1.0f, 1.0f, 1.0f);
+			Variant av = material_storage->material_get_param(p_material_rid, "pt_absorption");
+			if (av.get_type() == Variant::VECTOR3) {
+				Vector3 t = av;
+				tint = Color(t.x, t.y, t.z);
+			} else if (av.get_type() == Variant::COLOR) {
+				tint = av; // Already linear by contract: pt_absorption is declared without source_color.
+			} else if (pt_contract_cse) {
+				const ShaderLanguage::ShaderNode::Uniform *u = pt_contract_cse->uniforms.getptr("pt_absorption");
+				if (u && u->type == ShaderLanguage::TYPE_VEC3) {
+					tint = Color(_def_real(*u, 0), _def_real(*u, 1), _def_real(*u, 2));
+				}
+			}
+			float dist = MAX(get_pt_float("pt_absorption_distance", 1.0f), 0.001f);
+			mat.absorption_sigma[0] = -Math::log(CLAMP(tint.r, 0.0001f, 1.0f)) / dist;
+			mat.absorption_sigma[1] = -Math::log(CLAMP(tint.g, 0.0001f, 1.0f)) / dist;
+			mat.absorption_sigma[2] = -Math::log(CLAMP(tint.b, 0.0001f, 1.0f)) / dist;
 		}
 	}
 
@@ -2447,6 +2510,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				} else {
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 				}
+				// See the identical block in the regular-surface path below:
+				// transmissive materials override the global back-face cull so
+				// that exit interfaces exist.
+				if (mat_data->data.transmission > 0.0f) {
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+				}
 				if (mat_data->rt_sbt_offset > 0) {
 					const SceneShaderRaytracing::CustomShaderEntry *cse =
 							rt_shader_singleton->get_custom_shader_entry(mat_data->rt_sbt_offset);
@@ -2612,6 +2681,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			} else {
 				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
+			}
+
+			// Transmissive contract materials must see their own BACK faces --
+			// the exit interface is where the second refraction, TIR and the
+			// Beer-Lambert bounds live. PT rays cull back faces globally
+			// (RT_RAY_FLAGS, correct for the opaque world); this instance bit is
+			// the per-instance override, scoped to exactly the geometry that
+			// opted in. Without it the transmission lobe degenerates to a
+			// single-refraction shell and absorption never fires, because no
+			// back-face hits exist.
+			if (mat_data->data.transmission > 0.0f) {
+				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
 			}
 
 			if (mat_data->rt_sbt_offset > 0) {

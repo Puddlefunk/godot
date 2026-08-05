@@ -105,6 +105,7 @@ V mul(const M &m, const V &v) {
 // BRDF types
 #define DIFFUSE_TYPE 1
 #define SPECULAR_TYPE 2
+#define TRANSMISSION_TYPE 3 // Delta dielectric transmission (Fresnel reflect/refract split inside the lobe)
 
 // PIs
 #ifndef PI
@@ -276,6 +277,9 @@ struct MaterialProperties {
 	float dielectricF0; // Base reflectance for dielectrics (e.g. 0.04 for default 4% reflectance).
 	float transmissivness;
 	float opacity;
+	// Relative IOR for THIS hit (n_incident / n_transmitted). The caller resolves
+	// entering vs. exiting via front-face before filling this in.
+	float eta;
 };
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -1096,6 +1100,20 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 #endif
 }
 
+// Exact (unpolarized) dielectric Fresnel. eta = n_incident / n_transmitted.
+// Returns 1.0 on total internal reflection. Schlick is NOT a substitute here:
+// it has no TIR and misbehaves on the dense->thin (exiting) side.
+float fresnelDielectric(float cosThetaI, float eta) {
+	float sin2ThetaT = eta * eta * (1.0f - cosThetaI * cosThetaI);
+	if (sin2ThetaT >= 1.0f) {
+		return 1.0f; // TIR
+	}
+	float cosThetaT = sqrt(1.0f - sin2ThetaT);
+	float rs = (eta * cosThetaI - cosThetaT) / (eta * cosThetaI + cosThetaT);
+	float rp = (cosThetaI - eta * cosThetaT) / (cosThetaI + eta * cosThetaT);
+	return 0.5f * (rs * rs + rp * rp);
+}
+
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)
 bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight, float4 debug) {
 	// Ignore incident ray coming from "below" the hemisphere
@@ -1129,6 +1147,31 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	} else if (brdfType == SPECULAR_TYPE) {
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, material);
 		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, u, sampleWeight);
+	} else if (brdfType == TRANSMISSION_TYPE) {
+		// Smooth dielectric: delta lobes only, no rough (Walter GGX) refraction.
+		// Fresnel picks reflection vs refraction; the F / (1-F) selection
+		// probability cancels against the lobe value, so both branches carry
+		// weight ~1.
+		const float cosThetaI = min(max(0.00001f, Vlocal.z), 1.0f);
+		const float F = fresnelDielectric(cosThetaI, material.eta);
+
+		if (u.x < F) {
+			// Mirror reflection above the hemisphere.
+			rayDirectionLocal = float3(-Vlocal.x, -Vlocal.y, Vlocal.z);
+			sampleWeight = float3(1.0f, 1.0f, 1.0f);
+		} else {
+			// Refraction BELOW the hemisphere — legitimate for this lobe; the
+			// geometry-plane rejection at the end of this function is exempted.
+			rayDirectionLocal = refract(-Vlocal, Nlocal, material.eta);
+			if (dot(rayDirectionLocal, rayDirectionLocal) < 0.5f) {
+				// refract() degenerated (grazing/TIR edge the F test rounded
+				// past): fall back to the mirror direction instead of a zero ray.
+				rayDirectionLocal = float3(-Vlocal.x, -Vlocal.y, Vlocal.z);
+			}
+			// Surface tint only. Volumetric absorption (Beer-Lambert) comes from
+			// the pt_absorption contract input, not from a surface weight.
+			sampleWeight = material.baseColor;
+		}
 	}
 
 	// Transform sampled direction Llocal back to V vector space.
@@ -1144,7 +1187,10 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	// Prevent tracing direction "under" the hemisphere (behind the triangle).
 	// The caller is expected to handle this case: either terminate the path,
 	// or mirror the direction across the geometry plane to keep it above.
-	if (dot(geometryNormal, rayDirection) <= 0.0f) {
+	// Transmission is EXEMPT -- refracted rays legitimately continue below
+	// the geometry plane; rejecting (or mirroring) them here silently turns
+	// glass into a mirror.
+	if (brdfType != TRANSMISSION_TYPE && dot(geometryNormal, rayDirection) <= 0.0f) {
 		return false;
 	}
 

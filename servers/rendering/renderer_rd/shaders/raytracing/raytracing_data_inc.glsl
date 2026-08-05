@@ -80,7 +80,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 96 bytes)
+// MATERIAL DATA (matches C++ layout, 128 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -103,4 +103,16 @@ struct MaterialData {
 	float normal_map_depth; // Normal map strength (default 1.0)
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none)
+
+	// Pathtracer material contract (see render_raytracing.h).
+	// Scalars, not vec3: std430 vec3 would force 16-byte alignment and shift
+	// every offset after it.
+	float transmission; // 0 = opaque, 1 = full delta dielectric transmission.
+	float ior;
+	float absorption_r; // Beer-Lambert sigma/m per channel.
+	float absorption_g;
+	float absorption_b;
+	float _pad0;
+	float _pad1;
+	float _pad2;
 };
