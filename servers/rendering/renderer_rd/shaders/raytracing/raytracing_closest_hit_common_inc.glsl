@@ -486,6 +486,16 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
 		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness));
+
+		// Emissive surfaces must carry their emission in the demodulation guide:
+		// Ray Reconstruction smooths the demodulated signal as if it were lighting,
+		// so detail present only in radiance is flattened. The guide is preserved
+		// at full resolution, so the detail has to live here. Same approach CAPCOM
+		// describe for animated emissive patterns in RE ENGINE (GDC 2026), though
+		// that implementation replaces albedo outright and also covers the
+		// specular guide; this only adds to diffuse.
+		diffuse_albedo += m.emissive;
+
 		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
