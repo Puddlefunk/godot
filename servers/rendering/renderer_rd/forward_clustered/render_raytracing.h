@@ -206,7 +206,7 @@ enum {
 // Maps GeometryInstance3D.cast_shadow to mask bits. Raster parity:
 // SHADOWS_ONLY is absent from reflections/GI too, so it gets SHADOW alone.
 // DOUBLE_SIDED is a geometry concern (handled via cast_double_sided_shadows
-// plumbing), not a participation concern — same mask as ON.
+// plumbing), not a participation concern -- same mask as ON.
 inline uint32_t rt_instance_mask_from_cast_shadows(RSE::ShadowCastingSetting p_setting) {
 	switch (p_setting) {
 		case RSE::SHADOW_CASTING_SETTING_OFF:

@@ -111,7 +111,7 @@ vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_dep
 // UV1 TRIPLANAR (StandardMaterial3D parity under PT)
 // ============================================================================
 // Raster triplanar lives in BaseMaterial3D's GENERATED shader code, which the
-// PT hit path never runs — so PT reimplements the same math from the record:
+// PT hit path never runs -- so PT reimplements the same math from the record:
 // weights = pow(abs(N), sharpness)/sum, pos = P * uv1_scale + uv1_offset then
 // pos *= (1,-1,1), samples xy*w.z + xz*w.y + zy*(-1,1)*w.x (material.cpp
 // ~1391-1473 is the reference). Object mode uses MODEL space: for compressed
@@ -532,7 +532,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	// Beer-Lambert absorption. If we are exiting a transmissive
 	// medium through its back face, the segment just traversed was INSIDE it
-	// (convex bodies; nested media out of scope) — attenuate over gl_HitTEXT
+	// (convex bodies; nested media out of scope) -- attenuate over gl_HitTEXT
 	// meters with the precomputed sigma. Before the emissive add, so anything
 	// seen at or beyond this surface is tinted by the interior.
 	if (contract_md.transmission > 0.0 && !h.is_front_face) {

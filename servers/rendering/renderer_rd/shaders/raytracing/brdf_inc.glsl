@@ -1160,7 +1160,7 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 			rayDirectionLocal = float3(-Vlocal.x, -Vlocal.y, Vlocal.z);
 			sampleWeight = float3(1.0f, 1.0f, 1.0f);
 		} else {
-			// Refraction BELOW the hemisphere — legitimate for this lobe; the
+			// Refraction BELOW the hemisphere -- legitimate for this lobe; the
 			// geometry-plane rejection at the end of this function is exempted.
 			rayDirectionLocal = refract(-Vlocal, Nlocal, material.eta);
 			if (dot(rayDirectionLocal, rayDirectionLocal) < 0.5f) {
