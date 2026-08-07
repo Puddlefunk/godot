@@ -424,6 +424,13 @@ EditorThemeManager::ThemeConfiguration EditorThemeManager::_create_theme_config(
 		EditorSettings::get_singleton()->set_manually("interface/theme/additional_spacing", config.extra_spacing);
 	}
 
+	// SYNTHESIS PATCH: tint the editor so the patched PT build is distinguishable
+	// from the stock binary at a glance. Local override only — deliberately placed
+	// after every set_manually() above so nothing is written back to
+	// editor_settings-4.7.tres, which is SHARED with the stock build.
+	config.base_color = config.base_color.lerp(Color(0.13, 0.24, 0.19), 0.35);
+	config.accent_color = config.accent_color.lerp(Color(0.35, 0.85, 0.55), 0.85);
+
 	// Generated properties.
 
 	config.dark_theme = is_dark_theme();
