@@ -623,7 +623,21 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// describe for animated emissive patterns in RE ENGINE (GDC 2026), though
 		// that implementation replaces albedo outright and also covers the
 		// specular guide; this only adds to diffuse.
-		diffuse_albedo += m.emissive;
+		//
+		// 11 Aug: the emission is Reinhard-normalized before it enters the
+		// guide. Raw HDR emission (glow_energy beyond ~2) pushed the guide far
+		// outside the range RR treats as an albedo, garbling under motion —
+		// the same failure the specular guide's UNORM8 clamp below fixes
+		// empirically. The guide needs the emission PATTERN, not its
+		// magnitude: normalizing keeps the rim/cap/tip detail at full
+		// resolution while the actual energy stays in radiance where it
+		// belongs. Clamped like the specular guide for the same reason.
+		vec3 guide_emissive = m.emissive;
+		float guide_peak = max(guide_emissive.r, max(guide_emissive.g, guide_emissive.b));
+		if (guide_peak > 0.0) {
+			diffuse_albedo += guide_emissive / (1.0 + guide_peak);
+		}
+		diffuse_albedo = clamp(diffuse_albedo, vec3(0.0), vec3(1.0));
 
 		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
@@ -664,47 +678,56 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// =================================================================
 	path_pack(payload, ps);
 
+	// Lobe-selection probability, computed ONCE and shared by the NEE-side
+	// MIS weight and the BSDF sampler below — both consumers must agree or
+	// the balance weights stop summing to 1.
+	float specularLum = luminance(specularF0);
+	float diffuseLum = luminance(diffuseReflectance);
+	float specular_select_p;
+	if (diffuseLum < 0.0001) {
+		specular_select_p = 1.0;
+	} else if (specularLum < 0.0001) {
+		specular_select_p = 0.0;
+	} else {
+		specular_select_p = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
+	}
+
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	// Delta transmission has zero BRDF value in any NEE-sampled light direction,
-	// so skip direct light sampling entirely on transmissive hits.
-	if (rt_light_count > 0u && brdf_mat.transmissivness == 0.0) {
+	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_TRI_COUNT));
+	// Delta transmission has zero BRDF value in any NEE-sampled light
+	// direction, so skip direct light sampling entirely on those hits.
+	// (Step 2b's thin-walled diffuse lobe is NEE-compatible and must NOT be
+	// caught by this gate when it lands — key it on the DELTA lobe.)
+	if ((rt_light_count > 0u || rt_emissive_count > 0u) && brdf_mat.transmissivness == 0.0) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
+				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count,
+				rt_emissive_count, get_rt_param(RT_PARAM_EMISSIVE_POOL_PROB), specular_select_p);
 		ps.radiance += ps.throughput * direct_light;
 	}
 
 	// =================================================================
 	// BRDF importance sampling for next bounce
 	// =================================================================
-	float specularLum = luminance(specularF0);
-	float diffuseLum = luminance(diffuseReflectance);
-
 	int brdfType;
-	float specular_select_p = 0.0; // probability the lobe coin picks specular; feeds combinedBRDFPdf below
 	if (brdf_mat.transmissivness > 0.0) {
 		// Transmissive surface: the two-way split becomes three-way. For a full
 		// delta dielectric the Fresnel reflect/refract choice lives INSIDE the
 		// lobe, so there is no selection probability to divide out here.
 		// Partial transmission mixing diffuse/specular is not handled yet.
 		brdfType = TRANSMISSION_TYPE;
-	} else if (diffuseLum < 0.0001) {
+	} else if (specular_select_p >= 1.0) {
 		brdfType = SPECULAR_TYPE;
-		specular_select_p = 1.0;
-	} else if (specularLum < 0.0001) {
+	} else if (specular_select_p <= 0.0) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
-		float brdfProbability = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
-		// Recorded for the MIS pdf below: the OVERALL pdf of this vertex's
-		// sampling is the lobe mixture, whichever lobe the coin picked.
-		specular_select_p = brdfProbability;
-		if (rand(ps.rng_state) < brdfProbability) {
+		if (rand(ps.rng_state) < specular_select_p) {
 			brdfType = SPECULAR_TYPE;
-			ps.throughput /= brdfProbability;
+			ps.throughput /= specular_select_p;
 		} else {
 			brdfType = DIFFUSE_TYPE;
-			ps.throughput /= (1.0 - brdfProbability);
+			ps.throughput /= (1.0 - specular_select_p);
 		}
 	}
 

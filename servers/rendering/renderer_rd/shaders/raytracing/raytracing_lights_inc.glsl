@@ -289,11 +289,183 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 }
 
 // ============================================================================
+// Emissive Triangle Lights (HANDOFF_DIFFUSE_EMISSIVES Steps 1-3)
+// Host-assembled per-frame table (binding 29) + reverse map (binding 30).
+// ============================================================================
+
+// Matches C++ RT_EmissiveTriData (96 B, std430, scalars only).
+struct RTEmissiveTriData {
+	float pos0_x, pos0_y, pos0_z; // world space
+	float pos1_x, pos1_y, pos1_z;
+	float pos2_x, pos2_y, pos2_z;
+	uint color_packed_0, color_packed_1, color_packed_2; // rgba8 per vertex (unpackUnorm4x8)
+	uint uv_packed_0, uv_packed_1, uv_packed_2; // 2xfp16 per vertex (unpackHalf2x16)
+	uint geometry_idx; // into geometries[]/materials[], THIS frame
+	uint prim_id;
+	float pulse_phase;
+	float area_ws;
+	// pdf INVARIANT: this is the probability the alias table actually uses.
+	// The sampler below divides by it; the reverse lookup reports it. A
+	// stale table costs efficiency; a mismatch between the two costs
+	// correctness.
+	float selection_pdf;
+	float alias_prob; // Vose: keep this entry if u < alias_prob, else alias_idx
+	uint alias_idx;
+	float _pad0;
+	float _pad1;
+};
+
+layout(set = 0, binding = 29, std430) readonly buffer EmissiveTriBuffer {
+	RTEmissiveTriData emissive_tris[];
+};
+
+// Reverse map: header of {segment offset, prim count} pairs per geometry_idx,
+// then per-geometry segments mapping prim_id -> table entry (or NONE).
+layout(set = 0, binding = 30, std430) readonly buffer EmissiveMapBuffer {
+	uint emissive_map[];
+};
+
+#define RT_EMISSIVE_NONE 0xFFFFFFFFu
+
+/// Reverse lookup for MIS: the FULL solid-angle pdf (pool probability
+/// included) with which the NEE sampler below would generate the hit
+/// described by the arguments. 0.0 = the light sampler cannot generate this
+/// hit (not in the table, wrong-facing, table empty) => the balance weight at
+/// the emissive add is exactly 1.0, i.e. hit-only behaviour for that path.
+float emissive_triangle_pdf(uint geometry_idx, uint prim_id, vec3 ray_origin, vec3 ray_dir, float hit_t, vec3 hit_geometry_normal) {
+	uint tri_count = uint(get_rt_param(RT_PARAM_EMISSIVE_TRI_COUNT));
+	if (tri_count == 0u) {
+		return 0.0;
+	}
+	float pool_prob = get_rt_param(RT_PARAM_EMISSIVE_POOL_PROB);
+	if (pool_prob <= 0.0) {
+		return 0.0;
+	}
+	uint off = emissive_map[geometry_idx * 2u];
+	if (off == RT_EMISSIVE_NONE) {
+		return 0.0;
+	}
+	uint cnt = emissive_map[geometry_idx * 2u + 1u];
+	if (prim_id >= cnt) {
+		return 0.0;
+	}
+	uint entry_idx = emissive_map[off + prim_id];
+	if (entry_idx == RT_EMISSIVE_NONE) {
+		return 0.0;
+	}
+	RTEmissiveTriData e = emissive_tris[entry_idx];
+	// Two-sided emitters (|cos|): matches the hit path, which adds emission
+	// regardless of facing; wrong-side NEE samples shadow out against the
+	// emitter's own body, so the conventions agree.
+	float cos_l = abs(dot(hit_geometry_normal, ray_dir));
+	if (cos_l < 1e-4 || e.area_ws <= 1e-12) {
+		return 0.0;
+	}
+	// Area-measure pdf (selection / area) converted to solid angle.
+	return pool_prob * e.selection_pdf * (hit_t * hit_t) / (e.area_ws * cos_l);
+}
+
+// ============================================================================
 // Next Event Estimation (NEE) - Direct Light Sampling
 // ============================================================================
 
-// Evaluate direct lighting using NEE with stochastic light selection.
-// Uses mini-batch reservoir sampling for importance-weighted light selection.
+/// One NEE sample from the emissive triangle pool: alias-table selection,
+/// uniform point on the triangle, canonical glow evaluated at the sampled
+/// barycentric (the rim→cap→tip ramp survives sampling exactly), per-channel
+/// shadow transmittance, MIS balance weight against BSDF sampling.
+/// Returns the fully weighted, pdf-divided contribution.
+vec3 lights_sample_emissive_triangle(
+		vec3 hit_pos,
+		vec3 N,
+		vec3 V,
+		MaterialProperties material,
+		inout uint rng_state,
+		float specular_select_p,
+		uint tri_count,
+		float pool_prob) {
+	// O(1) alias-table selection.
+	uint i = min(uint(rand(rng_state) * float(tri_count)), tri_count - 1u);
+	RTEmissiveTriData e = emissive_tris[i];
+	if (rand(rng_state) >= e.alias_prob) {
+		e = emissive_tris[e.alias_idx];
+	}
+	if (e.selection_pdf <= 0.0 || e.area_ws <= 1e-12) {
+		return vec3(0.0);
+	}
+
+	// Uniform point on the triangle (sqrt warp).
+	vec3 p0 = vec3(e.pos0_x, e.pos0_y, e.pos0_z);
+	vec3 p1 = vec3(e.pos1_x, e.pos1_y, e.pos1_z);
+	vec3 p2 = vec3(e.pos2_x, e.pos2_y, e.pos2_z);
+	vec2 u = rand2(rng_state);
+	float su = sqrt(u.x);
+	vec3 bary = vec3(1.0 - su, su * (1.0 - u.y), su * u.y);
+	vec3 P = p0 * bary.x + p1 * bary.y + p2 * bary.z;
+
+	vec3 to_p = P - hit_pos;
+	float dist_sq = dot(to_p, to_p);
+	if (dist_sq < 1e-6) {
+		return vec3(0.0); // Degenerate: sample point at the receiver.
+	}
+	float dist = sqrt(dist_sq);
+	vec3 L = to_p / dist;
+
+	if (dot(N, L) <= 0.0) {
+		return vec3(0.0);
+	}
+
+	// Two-sided emitter (|cos|), matching the hit path's facing-agnostic
+	// emissive add; wrong-side samples shadow out against the emitter body.
+	vec3 tri_n = normalize(cross(p1 - p0, p2 - p0));
+	float cos_l = abs(dot(tri_n, L));
+	if (cos_l < 1e-4) {
+		return vec3(0.0);
+	}
+
+	// FULL solid-angle pdf — composition IDENTICAL to emissive_triangle_pdf
+	// above (the pdf invariant lives or dies on these two staying twins).
+	float p_light = pool_prob * e.selection_pdf * dist_sq / (e.area_ws * cos_l);
+	if (!(p_light > 0.0)) {
+		return vec3(0.0);
+	}
+
+	// Canonical emission at the sampled barycentric.
+	vec4 vc = unpackUnorm4x8(e.color_packed_0) * bary.x +
+			unpackUnorm4x8(e.color_packed_1) * bary.y +
+			unpackUnorm4x8(e.color_packed_2) * bary.z;
+	vec2 vuv = unpackHalf2x16(e.uv_packed_0) * bary.x +
+			unpackHalf2x16(e.uv_packed_1) * bary.y +
+			unpackHalf2x16(e.uv_packed_2) * bary.z;
+	vec3 emission = pt_glow_evaluate(materials[e.geometry_idx], vc, vuv, scene_data_block.data.time, e.pulse_phase) *
+			scene_data_block.data.emissive_exposure_normalization;
+	if (dot(emission, emission) <= 0.0) {
+		return vec3(0.0);
+	}
+
+	// Per-channel transmittance: mushroom light through a crystal arrives
+	// tinted, for free.
+	vec3 shadow_transmittance = lights_trace_shadow_ray(hit_pos, L, dist, rng_state);
+	if (all(lessThan(shadow_transmittance, vec3(0.0001)))) {
+		return vec3(0.0);
+	}
+
+	vec3 brdf_diffuse, brdf_specular;
+	evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
+	vec3 brdf_value = brdf_diffuse + brdf_specular;
+
+	// MIS balance weight vs BSDF sampling. The BSDF pdf goes through the
+	// payload quantizer ROUNDTRIP so this weight and the hit-side weight sum
+	// to exactly 1 (raytracing_inc.glsl).
+	float p_bsdf = mis_pdf_roundtrip(combinedBRDFPdf(N, V, L, material, specular_select_p));
+	float w = p_light / (p_light + p_bsdf);
+
+	return brdf_value * emission * shadow_transmittance * (w / p_light);
+}
+
+// Evaluate direct lighting using NEE with stochastic light selection:
+// one sample per call, drawn from the analytic pool (mini-batch reservoir,
+// as ever) or the emissive triangle pool (alias table), chosen by the
+// host-computed power ratio in emissive_pool_prob.
 vec3 lights_evaluate_direct_lighting(
 		vec3 hit_pos,
 		vec3 N,
@@ -301,10 +473,31 @@ vec3 lights_evaluate_direct_lighting(
 		MaterialProperties material,
 		inout uint rng_state,
 		bool is_indirect_bounce,
-		uint light_count) {
-	if (light_count == 0u) {
+		uint light_count,
+		uint emissive_tri_count,
+		float emissive_pool_prob,
+		float specular_select_p) {
+	bool has_analytic = light_count > 0u;
+	bool has_emissive = emissive_tri_count > 0u;
+	if (!has_analytic && !has_emissive) {
 		return vec3(0.0);
 	}
+
+	// Pool selection. The pdf of whichever pool is chosen divides the
+	// contribution; analytic lights have no BSDF-sampling partner (they are
+	// not geometry), so their MIS weight stays 1 and only the emissive pool
+	// carries a balance weight.
+	// The host is the SINGLE authority for pool_e (already clamped/edge-cased
+	// there); do NOT reshape it here — the reverse lookup above reads the
+	// same raw param, and any disagreement between the two is pdf bias.
+	float pool_e = emissive_pool_prob;
+	if (has_emissive && (pool_e >= 1.0 || rand(rng_state) < pool_e)) {
+		// NOTE: p_light inside the helper already includes pool_e — it is
+		// the FULL pdf, so no further division here (and the hit-side
+		// reverse lookup reports the same full pdf; the twins must agree).
+		return lights_sample_emissive_triangle(hit_pos, N, V, material, rng_state, specular_select_p, emissive_tri_count, pool_e);
+	}
+	float analytic_inv_prob = 1.0 / (1.0 - pool_e);
 
 	// Mini-batch reservoir sampling: sample k lights, pick the best valid one.
 	const uint k = uint(min(RT_LIGHT_RESERVOIR_SIZE, int(light_count)));
@@ -406,7 +599,7 @@ vec3 lights_evaluate_direct_lighting(
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
 		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * shadow_transmittance;
-		return contribution / max(light_select_pdf, 1e-10);
+		return contribution * analytic_inv_prob / max(light_select_pdf, 1e-10);
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
@@ -433,66 +626,7 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
-		return brdf_value * light.emission * indirect_mul * shadow_transmittance / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * indirect_mul * shadow_transmittance * analytic_inv_prob / max(light_select_pdf, 1e-10);
 	}
 }
 
-// ============================================================================
-// Emissive Triangle Lights (HANDOFF_DIFFUSE_EMISSIVES)
-// Step 1 (landed): host-assembled per-frame table + reverse map, bound below.
-// Step 2 extends the reservoir selection above to sample the table; Step 3
-// replaces the pdf stub with the reverse lookup. Until then the buffers are
-// bound but unread, and the stub keeps the MIS skeleton inert.
-// ============================================================================
-
-// Matches C++ RT_EmissiveTriData (96 B, std430, scalars only).
-struct RTEmissiveTriData {
-	float pos0_x, pos0_y, pos0_z; // world space
-	float pos1_x, pos1_y, pos1_z;
-	float pos2_x, pos2_y, pos2_z;
-	uint color_packed_0, color_packed_1, color_packed_2; // rgba8 per vertex (unpackUnorm4x8)
-	uint uv_packed_0, uv_packed_1, uv_packed_2; // 2xfp16 per vertex (unpackHalf2x16)
-	uint geometry_idx; // into geometries[]/materials[], THIS frame
-	uint prim_id;
-	float pulse_phase;
-	float area_ws;
-	// pdf INVARIANT: this is the probability the alias table actually uses.
-	// The Step-2 sampler divides by it; the Step-3 reverse lookup reports it.
-	float selection_pdf;
-	float alias_prob; // Vose: keep this entry if u < alias_prob, else alias_idx
-	uint alias_idx;
-	float _pad0;
-	float _pad1;
-};
-
-layout(set = 0, binding = 29, std430) readonly buffer EmissiveTriBuffer {
-	RTEmissiveTriData emissive_tris[];
-};
-
-// Reverse map: header of {segment offset, prim count} pairs per geometry_idx,
-// then per-geometry segments mapping prim_id -> table entry (or NONE).
-//   off = emissive_map[g * 2]; cnt = emissive_map[g * 2 + 1];
-//   entry = (off != RT_EMISSIVE_NONE && prim_id < cnt) ? emissive_map[off + prim_id] : RT_EMISSIVE_NONE;
-layout(set = 0, binding = 30, std430) readonly buffer EmissiveMapBuffer {
-	uint emissive_map[];
-};
-
-#define RT_EMISSIVE_NONE 0xFFFFFFFFu
-
-/// Reverse lookup for MIS: the solid-angle pdf with which the NEE emissive
-/// triangle sampler WOULD generate the hit described by the arguments, seen
-/// from the previous path vertex (`ray_origin`). Composition once real:
-/// P(select this triangle from the alias table) × P(this point on it),
-/// converted to solid angle via hit_t² / (area · |cos θ_light|).
-/// Returns 0.0 for geometry the light sampler cannot generate (not in the
-/// emitter table) — which makes the balance weight in shade_and_bounce
-/// exactly 1.0, i.e. hit-only emissive behaviour, no energy change.
-///
-/// INVARIANT (write it once, obey it forever): the pdf returned here must be
-/// the pdf the Step-2 sampler ACTUALLY uses — same table generation, same
-/// staleness. A stale table costs efficiency; a mismatch between this
-/// function and the sampler costs correctness.
-float emissive_triangle_pdf(uint geometry_idx, uint prim_id, vec3 ray_origin, vec3 ray_dir, float hit_t, vec3 hit_geometry_normal) {
-	// Step 0 stub: no emitter table yet, nothing is a sampled light.
-	return 0.0;
-}

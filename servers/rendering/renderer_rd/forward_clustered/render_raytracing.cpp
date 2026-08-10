@@ -532,12 +532,11 @@ void RenderRaytracing::prepare_frame() {
 	motion_transforms.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
-	emissive_tri_data.clear();
-	emissive_tri_power.clear();
-	emissive_map_segments.clear();
-	emissive_map_slots.clear();
-	emissive_map_data.clear();
-	emissive_total_power = 0.0f;
+	emissive_pending.clear();
+	emissive_table_dirty = false;
+	// NOTE: the emissive table arrays are NOT cleared here — they persist
+	// across frames and are rebuilt only when the fingerprint changes (see
+	// _finalize_emissive_table).
 
 	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 	RD *rd = RD::get_singleton();
@@ -1989,10 +1988,16 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
 			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
-	update_or_grow(p_state->emissive_tri_buffer, p_state->emissive_tri_buffer_capacity,
-			emissive_tri_data.ptr(), emissive_tri_data.size() * sizeof(RT_EmissiveTriData));
-	update_or_grow(p_state->emissive_map_buffer, p_state->emissive_map_buffer_capacity,
-			emissive_map_data.ptr(), emissive_map_data.size() * sizeof(uint32_t));
+	// Upload on fingerprint change, or into a viewport state that has never
+	// received the table (fresh state while the global table is clean).
+	if (emissive_table_dirty || (!p_state->emissive_tri_buffer.is_valid() && !emissive_tri_data.is_empty())) {
+		// ~40 MB at field scale — never a steady per-frame cost (see the
+		// emissive members in the header).
+		update_or_grow(p_state->emissive_tri_buffer, p_state->emissive_tri_buffer_capacity,
+				emissive_tri_data.ptr(), emissive_tri_data.size() * sizeof(RT_EmissiveTriData));
+		update_or_grow(p_state->emissive_map_buffer, p_state->emissive_map_buffer_capacity,
+				emissive_map_data.ptr(), emissive_map_data.size() * sizeof(uint32_t));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2789,7 +2794,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index).is_valid();
 				if (!deformed && inst_mat.glow_energy > 0.0f) {
 					_ensure_surface_emissive_src(surf_data, surf->owner->data->base, surf->surface_index, surface_counter);
-					_append_emissive_instance(surf_data, inst_mat, (uint32_t)geometry_data.size() - 1u, final_transform);
+					if (!surf_data->emissive_src.is_empty()) {
+						EmissivePendingInstance pend;
+						pend.surf_data = surf_data;
+						pend.geometry_idx = (uint32_t)geometry_data.size() - 1u;
+						pend.xform = final_transform;
+						emissive_pending.push_back(pend);
+					}
 				}
 			}
 
@@ -3149,12 +3160,59 @@ void RenderRaytracing::_append_emissive_instance(RTSurfaceData *p_surf_data, con
 	emissive_map_segments.push_back(seg);
 }
 
-/// Power quadrature + Vose alias table + reverse-map assembly, once per frame
-/// after the TLAS instance loop. p_time drives the live pulse: table power is
-/// exact for the frame that renders it — no staleness window at all.
+/// Fingerprint gate + (when dirty) power quadrature, Vose alias table and
+/// reverse-map assembly. The fingerprint hashes everything the table depends
+/// on except TIME; pulse-stale powers between rebuilds are safe by the pdf
+/// invariant (see the member comment in the header).
 void RenderRaytracing::_finalize_emissive_table(float p_time) {
-	const uint32_t n = emissive_tri_data.size();
+	// FNV-1a over the pending set: membership, order, geometry indices,
+	// transforms (exact bytes: any movement rebuilds), surface cache
+	// versions, and the glow params + phase of each instance's material.
+	uint64_t fp = 0xcbf29ce484222325ULL;
+	auto fnv = [&fp](const void *p_data, size_t p_len) {
+		const uint8_t *b = (const uint8_t *)p_data;
+		for (size_t i = 0; i < p_len; i++) {
+			fp = (fp ^ b[i]) * 0x100000001b3ULL;
+		}
+	};
+	for (uint32_t i = 0; i < emissive_pending.size(); i++) {
+		const EmissivePendingInstance &pend = emissive_pending[i];
+		fnv(&pend.geometry_idx, sizeof(uint32_t));
+		fnv(&pend.surf_data, sizeof(void *));
+		fnv(&pend.surf_data->emissive_src_counter, sizeof(uint32_t));
+		float xf[12];
+		for (int c = 0; c < 3; c++) {
+			xf[c * 3 + 0] = (float)pend.xform.basis.rows[c].x;
+			xf[c * 3 + 1] = (float)pend.xform.basis.rows[c].y;
+			xf[c * 3 + 2] = (float)pend.xform.basis.rows[c].z;
+		}
+		xf[9] = (float)pend.xform.origin.x;
+		xf[10] = (float)pend.xform.origin.y;
+		xf[11] = (float)pend.xform.origin.z;
+		fnv(xf, sizeof(xf));
+		const RT_MaterialData &md = material_data[pend.geometry_idx];
+		fnv(&md.glow_color[0], sizeof(float) * 11); // color..pulse_phase, contiguous
+	}
+
+	if (fp == emissive_fingerprint_last) {
+		return; // Table current (up to pulse wobble). No rebuild, no upload.
+	}
+	emissive_fingerprint_last = fp;
+	emissive_table_dirty = true;
+
+	emissive_tri_data.clear();
+	emissive_tri_power.clear();
+	emissive_map_segments.clear();
+	emissive_map_slots.clear();
+	emissive_map_data.clear();
 	emissive_total_power = 0.0f;
+
+	for (uint32_t i = 0; i < emissive_pending.size(); i++) {
+		const EmissivePendingInstance &pend = emissive_pending[i];
+		_append_emissive_instance(pend.surf_data, material_data[pend.geometry_idx], pend.geometry_idx, pend.xform);
+	}
+
+	const uint32_t n = emissive_tri_data.size();
 
 	// --- Per-triangle power: degree-2 edge-midpoint quadrature of the
 	// canonical glow formula. The integrand is NOT barycentric-linear
@@ -3589,9 +3647,30 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_TRI_COUNT] = float(emissive_tri_data.size());
+
+		// NEE pool split: probability of drawing the emissive triangle pool
+		// vs the analytic pool, from a crude power ratio. Efficiency-only —
+		// the shader divides by the same probability it selects with, so a
+		// bad ratio costs variance, never energy.
+		{
+			float analytic_power = 0.0f;
+			for (uint32_t li = 0; li < rt_light_count; li++) {
+				const RT_LightData &ld = rt_light_data[li];
+				analytic_power += MAX(0.0f, 0.2126f * ld.emission[0] + 0.7152f * ld.emission[1] + 0.0722f * ld.emission[2]);
+			}
+			float pool_prob = 0.0f;
+			if (emissive_total_power > 0.0f) {
+				pool_prob = (analytic_power > 0.0f)
+						? CLAMP(emissive_total_power / (emissive_total_power + analytic_power), 0.05f, 0.95f)
+						: 1.0f;
+			}
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_POOL_PROB] = pool_prob;
+		}
 		if (emissive_tri_data.size() != emissive_logged_count) {
 			emissive_logged_count = emissive_tri_data.size();
-			print_line(vformat("RT emissive table: %d triangles, total power %.3f, map %d words",
+			// Demoted from print_line after Step 2/3 acceptance (11 Aug):
+			// run with --verbose to watch the table breathe.
+			print_verbose(vformat("RT emissive table: %d triangles, total power %.3f, map %d words",
 					(int)emissive_tri_data.size(), emissive_total_power, (int)emissive_map_data.size()));
 		}
 

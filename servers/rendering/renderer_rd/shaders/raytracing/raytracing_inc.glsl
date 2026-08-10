@@ -20,6 +20,7 @@
 #define RT_PARAM_MAX_BOUNCES 2 // rt_params[0].z - Maximum ray bounces
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
 #define RT_PARAM_EMISSIVE_TRI_COUNT 4 // rt_params[1].x - Entries in the emissive triangle table (binding 29)
+#define RT_PARAM_EMISSIVE_POOL_PROB 5 // rt_params[1].y - P(NEE draws from the emissive pool); power-ratio, host-computed
 // Indices 4-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation

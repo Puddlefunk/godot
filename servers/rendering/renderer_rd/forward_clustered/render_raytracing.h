@@ -516,6 +516,27 @@ class RenderRaytracing {
 	// a persisted table would silently go stale — per-frame assembly from the
 	// per-surface caches is cheap (thousands of tris) and makes the staleness
 	// contract trivial: the table is always exactly current.
+	// Reality check (11 Aug, first live run): the handoff's "thousands, not
+	// millions" was wrong — a streamed-in field is ~400k emissive triangles
+	// (~40 MB of table). Rebuilding and re-uploading that per frame is real
+	// CPU + PCIe cost, so assembly is FINGERPRINT-GATED: the per-frame loop
+	// only collects pending instances (cheap, O(instances)) and hashes
+	// membership, geometry indices, transforms, surface versions and glow
+	// params. The table is rebuilt only when the hash changes. Pulse-stale
+	// powers between rebuilds are safe BY THE PDF INVARIANT — the table's
+	// selection_pdf is simultaneously what the sampler divides by and what
+	// the reverse lookup reports, so staleness costs sampling efficiency
+	// (±pulse_depth wobble), never correctness; radiance is evaluated live
+	// from TIME either way.
+	struct EmissivePendingInstance {
+		RTSurfaceData *surf_data = nullptr;
+		uint32_t geometry_idx = 0;
+		Transform3D xform;
+	};
+	LocalVector<EmissivePendingInstance> emissive_pending;
+	uint64_t emissive_fingerprint_last = 0;
+	bool emissive_table_dirty = false;
+
 	LocalVector<RT_EmissiveTriData> emissive_tri_data;
 	LocalVector<float> emissive_tri_power; // parallel scratch; alias-table input
 	struct EmissiveMapSegment {
