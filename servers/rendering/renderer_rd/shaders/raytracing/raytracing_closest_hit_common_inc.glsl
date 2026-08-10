@@ -530,11 +530,13 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// render_raytracing.cpp (read by name -- never inferred from raster channels).
 	MaterialData contract_md = materials[h.geometry_idx];
 
-	// Beer-Lambert absorption. If we are exiting a transmissive
-	// medium through its back face, the segment just traversed was INSIDE it
-	// (convex bodies; nested media out of scope) -- attenuate over gl_HitTEXT
-	// meters with the precomputed sigma. Before the emissive add, so anything
-	// seen at or beyond this surface is tinted by the interior.
+	// Beer-Lambert absorption. If we are exiting a transmissive medium
+	// through its back face, the segment just traversed was INSIDE it --
+	// attenuate over gl_HitTEXT meters with the precomputed sigma. CORRECT
+	// ONLY FOR CONVEX SOLIDS: on a non-convex body (bell, shell) this bills
+	// interior air gaps to the medium. Nested/non-convex media need interior
+	// tracking -- planned, not yet built. Before the emissive add, so
+	// anything seen at or beyond this surface is tinted by the interior.
 	if (contract_md.transmission > 0.0 && !h.is_front_face) {
 		vec3 sigma = vec3(contract_md.absorption_r, contract_md.absorption_g, contract_md.absorption_b);
 		ps.throughput *= exp(-sigma * gl_HitTEXT);
