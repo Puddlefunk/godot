@@ -117,4 +117,57 @@ struct MaterialData {
 	float triplanar_sharpness;
 	float uv1_scale_z; // z of Godot's Vector3 uv1_scale (xy above).
 	float uv1_offset_z;
+	// pt_glow contract (flag bit 32 gates use). Scalars, not vec3 — same
+	// std430 alignment reasoning as the transmission contract above.
+	// Snapshotted host-side from the declaring shader's uniforms; LINEAR.
+	// Consumed exclusively through pt_glow_evaluate below — hit path, NEE
+	// and emitter-table power all share that one formula.
+	float glow_color_r;
+	float glow_color_g;
+	float glow_color_b;
+	float glow_energy;
+	float glow_rim_power;
+	float glow_rim_boost;
+	float glow_core_floor;
+	float glow_membrane_boost;
+	float glow_pulse_rate_hz;
+	float glow_pulse_depth;
+	float _pad_glow0;
+	float _pad_glow1;
 };
+
+// Material flag bits (must match RT_MAT_FLAG_* in render_raytracing.h).
+const uint RT_MAT_FLAG_PT_GLOW = 32u;
+
+// ============================================================================
+// pt_glow — THE canonical organism glow evaluation
+// (HANDOFF_DIFFUSE_EMISSIVES Step 1). The raster shader (organism_flesh)
+// computes the same formula from the same uniforms for renderer parity, but
+// under PT this function is authoritative: the closest-hit override, the NEE
+// triangle sampler (Step 2) and the host emitter-table power integration
+// (which replicates it in C++) must all agree with THIS text.
+//
+// Inputs are the baked attributes the fork's hit fetch actually reads:
+//   vertex_color: COLOR — .b edge distance, .a emission mask (.r/.g are
+//                 palette weights, unused by glow)
+//   uv:           UV    — .x growth (unused by glow), .y membrane
+// pulse phase is derived from the instance's world origin, matching the
+// raster shader's vertex-stage hash — same instance, same phase, both
+// renderers.
+// NOTE: exposure normalization (scene_data.emissive_exposure_normalization)
+// is applied by the CALLER, matching how the custom-fragment emission path
+// applies it.
+// ============================================================================
+float pt_glow_phase(vec3 instance_world_origin) {
+	return fract(sin(dot(instance_world_origin, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+vec3 pt_glow_evaluate(MaterialData md, vec4 vertex_color, vec2 uv, float time_s, float phase) {
+	float edge_dist = vertex_color.b;
+	float membrane = uv.y;
+	float emission_mask = vertex_color.a;
+	float rim = pow(clamp(1.0 - edge_dist, 0.0, 1.0), md.glow_rim_power);
+	float glow = (md.glow_core_floor + rim * md.glow_rim_boost + membrane * md.glow_membrane_boost) * emission_mask;
+	float pulse = 1.0 + md.glow_pulse_depth * sin(time_s * 6.28318530718 * md.glow_pulse_rate_hz + phase * 6.28318530718);
+	return vec3(md.glow_color_r, md.glow_color_g, md.glow_color_b) * (md.glow_energy * glow * pulse);
+}

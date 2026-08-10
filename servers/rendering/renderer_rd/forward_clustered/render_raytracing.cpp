@@ -1474,6 +1474,20 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.absorption_sigma[0] = 0.0f;
 	mat.absorption_sigma[1] = 0.0f;
 	mat.absorption_sigma[2] = 0.0f;
+	// pt_glow contract: reset ALL fields — cache entries are reused, and a
+	// material that loses its contract must not keep stale glow (FINDINGS §4).
+	mat.glow_color[0] = 0.0f;
+	mat.glow_color[1] = 0.0f;
+	mat.glow_color[2] = 0.0f;
+	mat.glow_energy = 0.0f;
+	mat.glow_rim_power = 2.5f;
+	mat.glow_rim_boost = 0.0f;
+	mat.glow_core_floor = 0.0f;
+	mat.glow_membrane_boost = 0.0f;
+	mat.glow_pulse_rate_hz = 0.0f;
+	mat.glow_pulse_depth = 0.0f;
+	mat._pad_glow[0] = 0.0f;
+	mat._pad_glow[1] = 0.0f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1748,6 +1762,51 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			mat.absorption_sigma[0] = -Math::log(CLAMP(tint.r, 0.0001f, 1.0f)) / dist;
 			mat.absorption_sigma[1] = -Math::log(CLAMP(tint.g, 0.0001f, 1.0f)) / dist;
 			mat.absorption_sigma[2] = -Math::log(CLAMP(tint.b, 0.0001f, 1.0f)) / dist;
+		}
+
+		// pt_glow contract (HANDOFF_DIFFUSE_EMISSIVES Step 1). Declaring a
+		// `pt_glow` uniform is the opt-in SENTINEL; the species params are
+		// then snapshotted from the shader's existing uniform names so
+		// scripts, dev-menu strings and saved species resources keep working
+		// unrenamed. The engine-side formula (pt_glow_evaluate) becomes the
+		// canonical glow evaluation under PT — shared verbatim by the hit
+		// path, NEE triangle sampling and the emitter-table power
+		// integration.
+		Variant glow_sentinel = material_storage->material_get_param(p_material_rid, "pt_glow");
+		bool glow_opts_in = (glow_sentinel.get_type() == Variant::FLOAT || glow_sentinel.get_type() == Variant::INT) ||
+				(pt_contract_cse && pt_contract_cse->uniforms.has("pt_glow"));
+		if (glow_opts_in) {
+			mat.flags |= RT_MAT_FLAG_PT_GLOW;
+			mat.glow_energy = MAX(get_pt_float("glow_energy", 6.0f), 0.0f);
+			mat.glow_rim_power = CLAMP(get_pt_float("rim_power", 2.5f), 0.5f, 8.0f);
+			mat.glow_rim_boost = MAX(get_pt_float("rim_boost", 3.0f), 0.0f);
+			mat.glow_core_floor = CLAMP(get_pt_float("core_floor", 0.12f), 0.0f, 1.0f);
+			mat.glow_membrane_boost = MAX(get_pt_float("membrane_boost", 1.2f), 0.0f);
+			mat.glow_pulse_rate_hz = CLAMP(get_pt_float("pulse_rate_hz", 0.12f), 0.0f, 2.0f);
+			mat.glow_pulse_depth = CLAMP(get_pt_float("pulse_depth", 0.10f), 0.0f, 1.0f);
+
+			// glow_color is authored with source_color (artists get a color
+			// picker); material_get_param returns the raw sRGB value, so
+			// convert here — same treatment "emission" gets above.
+			Color glow_c(0.2f, 1.0f, 0.4f); // organism_flesh's declared default
+			Variant gcv = material_storage->material_get_param(p_material_rid, "glow_color");
+			if (gcv.get_type() == Variant::COLOR) {
+				glow_c = ((Color)gcv).srgb_to_linear();
+			} else if (gcv.get_type() == Variant::VECTOR3) {
+				Vector3 v = gcv; // No color hint on the uniform: already linear by contract.
+				glow_c = Color(v.x, v.y, v.z);
+			} else if (pt_contract_cse) {
+				const ShaderLanguage::ShaderNode::Uniform *u = pt_contract_cse->uniforms.getptr("glow_color");
+				if (u && (u->type == ShaderLanguage::TYPE_VEC4 || u->type == ShaderLanguage::TYPE_VEC3)) {
+					glow_c = Color(_def_real(*u, 0), _def_real(*u, 1), _def_real(*u, 2));
+					if (u->hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
+						glow_c = glow_c.srgb_to_linear();
+					}
+				}
+			}
+			mat.glow_color[0] = glow_c.r;
+			mat.glow_color[1] = glow_c.g;
+			mat.glow_color[2] = glow_c.b;
 		}
 	}
 

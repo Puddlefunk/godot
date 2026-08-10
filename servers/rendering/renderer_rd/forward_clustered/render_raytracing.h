@@ -126,8 +126,26 @@ struct alignas(16) RT_MaterialData {
 	float triplanar_sharpness; // uv1_blend_sharpness (default 1.0).
 	float uv1_scale_z;
 	float uv1_offset_z;
+	// pt_glow contract (HANDOFF_DIFFUSE_EMISSIVES Step 1): engine-owned
+	// organism glow. Declaring a `pt_glow` uniform is the opt-in sentinel;
+	// the species params below are then snapshotted from the shader's
+	// EXISTING uniform names (glow_color, glow_energy, rim_power, rim_boost,
+	// core_floor, membrane_boost, pulse_rate_hz, pulse_depth) so scripts and
+	// saved resources keep working. The canonical evaluation lives in
+	// pt_glow_evaluate (raytracing_data_inc.glsl) and is shared by the hit
+	// path, NEE triangle sampling, and the emitter-table power integration —
+	// one formula, no copies to keep in sync.
+	float glow_color[3]; // Linear (srgb_to_linear applied at snapshot).
+	float glow_energy;
+	float glow_rim_power;
+	float glow_rim_boost;
+	float glow_core_floor;
+	float glow_membrane_boost;
+	float glow_pulse_rate_hz;
+	float glow_pulse_depth;
+	float _pad_glow[2];
 };
-static_assert(sizeof(RT_MaterialData) == 128, "RT_MaterialData must be 128 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430 (was 128 before the pt_glow contract)");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -176,6 +194,9 @@ enum {
 	// uv1 triplanar mapping under PT.
 	RT_MAT_FLAG_TRIPLANAR = 8u,
 	RT_MAT_FLAG_TRIPLANAR_WORLD = 16u,
+	// pt_glow contract declared: engine-owned glow evaluation overrides the
+	// custom fragment's EMISSION under PT (see RT_MaterialData glow fields).
+	RT_MAT_FLAG_PT_GLOW = 32u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

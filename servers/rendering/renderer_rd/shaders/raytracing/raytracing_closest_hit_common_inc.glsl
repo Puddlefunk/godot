@@ -530,6 +530,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// render_raytracing.cpp (read by name -- never inferred from raster channels).
 	MaterialData contract_md = materials[h.geometry_idx];
 
+	// pt_glow contract: the engine-owned glow formula is authoritative under
+	// PT. Overrides whatever the custom fragment wrote to EMISSION so that
+	// this hit, the NEE triangle sampler (Step 2) and the emitter-table
+	// power (Step 1) evaluate ONE formula from the same snapshotted params —
+	// the two-copies-in-sync problem structurally cannot exist.
+	// gl_ObjectToWorldEXT[3] is the instance's world translation; the raster
+	// shader hashes the same origin for its pulse phase, so both renderers
+	// pulse identically.
+	if ((contract_md.flags & RT_MAT_FLAG_PT_GLOW) != 0u) {
+		float glow_phase = pt_glow_phase(gl_ObjectToWorldEXT[3]);
+		m.emissive = pt_glow_evaluate(contract_md, h.color, h.uv, scene_data_block.data.time, glow_phase) *
+				scene_data_block.data.emissive_exposure_normalization;
+	}
+
 	// Beer-Lambert absorption. If we are exiting a transmissive medium
 	// through its back face, the segment just traversed was INSIDE it --
 	// attenuate over gl_HitTEXT meters with the precomputed sigma. CORRECT
