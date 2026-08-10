@@ -542,8 +542,22 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.throughput *= exp(-sigma * gl_HitTEXT);
 	}
 
-	// Emissive contribution.
-	ps.radiance += ps.throughput * m.emissive;
+	// Emissive contribution, MIS-weighted against the NEE emissive-triangle
+	// sampler (HANDOFF_DIFFUSE_EMISSIVES Steps 0/3). While
+	// emissive_triangle_pdf is the Step-0 stub returning 0.0 the weight is
+	// exactly 1.0 — bit-identical to the historical unweighted add. Camera
+	// rays (total_bounces == 0) and delta/invalid previous bounces are
+	// unweighted by the prev_bsdf_pdf > 0.0 gate: the light sampler can
+	// never generate those path segments, so BSDF sampling keeps full
+	// credit for them.
+	float emissive_mis_weight = 1.0;
+	float prev_bsdf_pdf = mis_pdf_load(ps.packed_bounces_flags);
+	if (total_bounces > 0u && prev_bsdf_pdf > 0.0) {
+		float emissive_light_pdf = emissive_triangle_pdf(h.geometry_idx, uint(gl_PrimitiveID),
+				gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, h.geometry_normal);
+		emissive_mis_weight = prev_bsdf_pdf / (prev_bsdf_pdf + emissive_light_pdf);
+	}
+	ps.radiance += ps.throughput * m.emissive * emissive_mis_weight;
 
 	// Bounce limit check.
 	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
@@ -656,6 +670,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	float diffuseLum = luminance(diffuseReflectance);
 
 	int brdfType;
+	float specular_select_p = 0.0; // probability the lobe coin picks specular; feeds combinedBRDFPdf below
 	if (brdf_mat.transmissivness > 0.0) {
 		// Transmissive surface: the two-way split becomes three-way. For a full
 		// delta dielectric the Fresnel reflect/refract choice lives INSIDE the
@@ -664,10 +679,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		brdfType = TRANSMISSION_TYPE;
 	} else if (diffuseLum < 0.0001) {
 		brdfType = SPECULAR_TYPE;
+		specular_select_p = 1.0;
 	} else if (specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
 		float brdfProbability = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
+		// Recorded for the MIS pdf below: the OVERALL pdf of this vertex's
+		// sampling is the lobe mixture, whichever lobe the coin picked.
+		specular_select_p = brdfProbability;
 		if (rand(ps.rng_state) < brdfProbability) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= brdfProbability;
@@ -708,6 +727,24 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {
 		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
+	}
+
+	// MIS pdf transport (HANDOFF_DIFFUSE_EMISSIVES Step 0): carry this
+	// bounce's BSDF sampling pdf to the NEXT closest-hit, where the emissive
+	// add needs it for the balance heuristic. The fork shades in closest-hit
+	// (RTXPT/Falcor shade in raygen and keep PathState in registers), so the
+	// payload's free bits are the only channel between consecutive hits —
+	// see mis_pdf_store in raytracing_inc.glsl and PAYLOAD_BUDGET.md §3.
+	// Delta transmission has no finite pdf: clear the field, and the next
+	// emissive hit adds unweighted (weight-1 convention for delta bounces).
+	// A mirror-recovered direction reuses the same formula: the recovery is
+	// itself an approximation and the pdf follows the direction actually
+	// traced.
+	if (brdfType == TRANSMISSION_TYPE) {
+		ps.packed_bounces_flags = mis_pdf_clear(ps.packed_bounces_flags);
+	} else {
+		ps.packed_bounces_flags = mis_pdf_store(ps.packed_bounces_flags,
+				combinedBRDFPdf(N, V, next_dir, brdf_mat, specular_select_p));
 	}
 
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so

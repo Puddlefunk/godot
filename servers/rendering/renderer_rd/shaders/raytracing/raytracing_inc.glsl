@@ -37,7 +37,7 @@
 
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:8][diffuse:8][total:8]
+	uint packed_bounces_flags; //  4 bytes - [pdf-valid:1][pdf-hi:4][flags:3][pdf-lo:8][diffuse:8][total:8] — see mis_pdf_* below + PAYLOAD_BUDGET.md §3
 	uint rng_state; //  4 bytes - RNG state for PCG
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
@@ -128,6 +128,64 @@ uint clear_path_terminated(uint packed) {
 }
 bool is_path_terminated(uint packed) {
 	return (packed & PATH_TERMINATED_FLAG) != 0u;
+}
+
+// ============================================================================
+// MIS previous-bounce BSDF pdf (PAYLOAD_BUDGET.md §3; HANDOFF_DIFFUSE_EMISSIVES
+// Step 0). Occupies the previously free bits of packed_bounces_flags:
+//   bits 16-23 = pdf code low byte, bits 27-30 = pdf code high nibble,
+//   bit 31 = valid flag.
+// The pdf is stored as a 12-bit log2 quantization (range 2^-24 .. 2^40,
+// ~1% relative error — noise in the MIS weight, never bias, PROVIDED both
+// sides of the weight see the same value: the NEE-side balance weight must
+// use mis_pdf_roundtrip() on its locally-computed bsdf pdf so it matches
+// what the hit side will decode. Code 0 / valid-bit clear = "no finite pdf"
+// (camera ray or delta previous bounce) => emissive hits add unweighted.
+// Main path only; dead during shadow rays (whole payload is saved/restored
+// around lights_trace_shadow_ray, so no aliasing interaction with §4).
+// ============================================================================
+const uint MIS_PDF_VALID_FLAG = (1u << 31);
+const float MIS_PDF_LOG2_MIN = -24.0;
+const float MIS_PDF_LOG2_MAX = 40.0;
+
+// 12-bit code; 0 = no finite pdf. Codes 1..4095 span the log2 range.
+uint mis_pdf_encode(float pdf) {
+	if (!(pdf > 0.0)) { // negated compare also rejects NaN
+		return 0u;
+	}
+	float x = clamp((log2(pdf) - MIS_PDF_LOG2_MIN) / (MIS_PDF_LOG2_MAX - MIS_PDF_LOG2_MIN), 0.0, 1.0);
+	return 1u + uint(round(x * 4094.0));
+}
+float mis_pdf_decode(uint code) {
+	if (code == 0u) {
+		return 0.0;
+	}
+	float x = float(code - 1u) / 4094.0;
+	return exp2(MIS_PDF_LOG2_MIN + x * (MIS_PDF_LOG2_MAX - MIS_PDF_LOG2_MIN));
+}
+// What the hit side will see for a given pdf: quantize-then-dequantize.
+// The NEE side MUST use this on its bsdf pdf so both MIS weights sum to 1.
+float mis_pdf_roundtrip(float pdf) {
+	return mis_pdf_decode(mis_pdf_encode(pdf));
+}
+uint mis_pdf_clear(uint packed) {
+	return packed & ~((0xFFu << 16) | (0xFu << 27) | MIS_PDF_VALID_FLAG);
+}
+uint mis_pdf_store(uint packed, float pdf) {
+	packed = mis_pdf_clear(packed);
+	uint code = mis_pdf_encode(pdf);
+	if (code == 0u) {
+		return packed; // no finite pdf: leave valid flag clear
+	}
+	return packed | ((code & 0xFFu) << 16) | (((code >> 8) & 0xFu) << 27) | MIS_PDF_VALID_FLAG;
+}
+// Returns 0.0 when no finite pdf was stored (camera ray / delta bounce).
+float mis_pdf_load(uint packed) {
+	if ((packed & MIS_PDF_VALID_FLAG) == 0u) {
+		return 0.0;
+	}
+	uint code = ((packed >> 16) & 0xFFu) | (((packed >> 27) & 0xFu) << 8);
+	return mis_pdf_decode(code);
 }
 
 // Bounce limits

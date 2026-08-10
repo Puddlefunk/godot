@@ -436,3 +436,28 @@ vec3 lights_evaluate_direct_lighting(
 		return brdf_value * light.emission * indirect_mul * shadow_transmittance / max(light_select_pdf, 1e-10);
 	}
 }
+
+// ============================================================================
+// Emissive Triangle Lights (HANDOFF_DIFFUSE_EMISSIVES)
+// Step 1 builds the host-side emitter table + reverse index; Step 2 extends
+// the reservoir selection above to draw from it. Until then this stub keeps
+// the MIS skeleton (Step 0) compiled and inert.
+// ============================================================================
+
+/// Reverse lookup for MIS: the solid-angle pdf with which the NEE emissive
+/// triangle sampler WOULD generate the hit described by the arguments, seen
+/// from the previous path vertex (`ray_origin`). Composition once real:
+/// P(select this triangle from the alias table) × P(this point on it),
+/// converted to solid angle via hit_t² / (area · |cos θ_light|).
+/// Returns 0.0 for geometry the light sampler cannot generate (not in the
+/// emitter table) — which makes the balance weight in shade_and_bounce
+/// exactly 1.0, i.e. hit-only emissive behaviour, no energy change.
+///
+/// INVARIANT (write it once, obey it forever): the pdf returned here must be
+/// the pdf the Step-2 sampler ACTUALLY uses — same table generation, same
+/// staleness. A stale table costs efficiency; a mismatch between this
+/// function and the sampler costs correctness.
+float emissive_triangle_pdf(uint geometry_idx, uint prim_id, vec3 ray_origin, vec3 ray_dir, float hit_t, vec3 hit_geometry_normal) {
+	// Step 0 stub: no emitter table yet, nothing is a sampled light.
+	return 0.0;
+}

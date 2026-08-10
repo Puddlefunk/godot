@@ -1198,6 +1198,44 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 }
 
 // -------------------------------------------------------------------------
+//    Local addition (4): combined sampling PDF, for MIS
+//    Not part of the original Crash Course; added for emissive-triangle
+//    light sampling (HANDOFF_DIFFUSE_EMISSIVES Step 0).
+// -------------------------------------------------------------------------
+
+// Solid-angle PDF with which 'evalIndirectCombinedBRDF' plus the caller's
+// lobe selection generates direction L at this vertex.
+// 'specularProbability' MUST be the same selection probability the caller
+// used to choose SPECULAR_TYPE over DIFFUSE_TYPE (1.0/0.0 in the
+// degenerate single-lobe branches). Delta lobes (TRANSMISSION_TYPE) have
+// no finite pdf — callers handle them separately (MIS weight-1 convention).
+// Used on BOTH sides of the MIS balance weight; when the value crosses the
+// payload it is quantized — the NEE side must apply mis_pdf_roundtrip()
+// (raytracing_inc.glsl) to its locally computed value so the two weights
+// still sum to 1.
+float combinedBRDFPdf(float3 N, float3 V, float3 L, MaterialProperties material, float specularProbability) {
+	float NdotL = dot(N, L);
+	float NdotV = dot(N, V);
+	if (NdotL <= 0.0f || NdotV <= 0.0f) {
+		return 0.0f;
+	}
+	float diffusePdf = NdotL * ONE_OVER_PI;
+	float specPdf = 0.0f;
+	if (specularProbability > 0.0f) {
+		float alpha = material.roughness * material.roughness;
+		float alphaSquared = alpha * alpha;
+		float3 H = normalize(V + L);
+		float NdotH = clamp(dot(N, H), 0.00001f, 1.0f);
+		float LdotH = clamp(dot(L, H), 0.00001f, 1.0f);
+		// 'specularPdf' resolves to the active microfacet distribution's pdf
+		// (GGX VNDF by default) via the defines at the top of this file, so
+		// this stays correct if the distribution selection changes.
+		specPdf = specularPdf(alpha, alphaSquared, NdotH, NdotV, LdotH);
+	}
+	return lerp(diffusePdf, specPdf, specularProbability);
+}
+
+// -------------------------------------------------------------------------
 //    DLSS-RR G-buffer helpers (Environment BRDF approximation)
 // -------------------------------------------------------------------------
 
