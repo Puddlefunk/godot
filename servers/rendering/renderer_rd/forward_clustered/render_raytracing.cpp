@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/rendering_server.h" // mesh_create_arrays_from_surface_data (CPU decode for the emissive table)
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/environment_storage.h"
 
@@ -135,6 +136,12 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
+	}
+	if (p_state->emissive_tri_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->emissive_tri_buffer);
+	}
+	if (p_state->emissive_map_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->emissive_map_buffer);
 	}
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
@@ -525,6 +532,12 @@ void RenderRaytracing::prepare_frame() {
 	motion_transforms.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
+	emissive_tri_data.clear();
+	emissive_tri_power.clear();
+	emissive_map_segments.clear();
+	emissive_map_slots.clear();
+	emissive_map_data.clear();
+	emissive_total_power = 0.0f;
 
 	const uint32_t current_frame = RSG::rasterizer->get_frame_number();
 	RD *rd = RD::get_singleton();
@@ -1486,8 +1499,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.glow_membrane_boost = 0.0f;
 	mat.glow_pulse_rate_hz = 0.0f;
 	mat.glow_pulse_depth = 0.0f;
-	mat._pad_glow[0] = 0.0f;
-	mat._pad_glow[1] = 0.0f;
+	mat.glow_pulse_phase = 0.0f; // per-instance; written in build_tlas, not here
+	mat._pad_glow = 0.0f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1976,6 +1989,10 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			motion_indices.ptr(), motion_indices.size() * sizeof(int32_t));
 	update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
 			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
+	update_or_grow(p_state->emissive_tri_buffer, p_state->emissive_tri_buffer_capacity,
+			emissive_tri_data.ptr(), emissive_tri_data.size() * sizeof(RT_EmissiveTriData));
+	update_or_grow(p_state->emissive_map_buffer, p_state->emissive_map_buffer_capacity,
+			emissive_map_data.ptr(), emissive_map_data.size() * sizeof(uint32_t));
 }
 
 // ---------------------------------------------------------------------------
@@ -2753,6 +2770,29 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			sbt_offsets.push_back(mat_data->rt_sbt_offset);
 			material_data.push_back(mat_data->data);
 
+			// pt_glow: per-instance pulse phase + emitter-table append
+			// (HANDOFF_DIFFUSE_EMISSIVES Step 1). The phase is written into
+			// THIS instance's material_data copy — one CPU-computed value
+			// consumed identically by the hit path and the table (GPU sin()
+			// would not reproduce it; see glow_pulse_phase in the header).
+			if ((mat_data->data.flags & RT_MAT_FLAG_PT_GLOW) != 0u) {
+				const Vector3 o = final_transform.origin;
+				double h_sin = Math::sin(o.x * 12.9898 + o.y * 78.233 + o.z * 37.719) * 43758.5453;
+				float phase = (float)(h_sin - Math::floor(h_sin));
+				RT_MaterialData &inst_mat = material_data[material_data.size() - 1];
+				inst_mat.glow_pulse_phase = phase;
+
+				// Deformed surfaces are excluded from the emitter table in v1
+				// (cached object-space positions would be stale under
+				// skinning); their hits stay MIS weight-1, which is graceful.
+				bool deformed = inst->mesh_instance.is_valid() &&
+						mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index).is_valid();
+				if (!deformed && inst_mat.glow_energy > 0.0f) {
+					_ensure_surface_emissive_src(surf_data, surf->owner->data->base, surf->surface_index, surface_counter);
+					_append_emissive_instance(surf_data, inst_mat, (uint32_t)geometry_data.size() - 1u, final_transform);
+				}
+			}
+
 			// Determine per-instance TLAS flags from material properties.
 			uint32_t inst_flags = 0;
 			if (surf->shader) {
@@ -2949,10 +2989,272 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	RD::get_singleton()->compute_list_end();
 
+	// Emitter table power + alias + reverse map, from this frame's instances.
+	_finalize_emissive_table(p_render_data->scene_data->time);
+
 	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 	finalize_buffers(state);
 
 	return state;
+}
+
+// ---------------------------------------------------------------------------
+// Emissive triangle table (HANDOFF_DIFFUSE_EMISSIVES Step 1)
+// ---------------------------------------------------------------------------
+
+/// Decode a surface's emissive source triangles ONCE per surface version.
+/// Object-space positions + packed attributes, cached on the surface entry.
+void RenderRaytracing::_ensure_surface_emissive_src(RTSurfaceData *p_surf_data, RID p_mesh_rid, uint32_t p_surface_index, uint32_t p_surface_counter) {
+	if (p_surf_data->emissive_src_counter == p_surface_counter) {
+		return;
+	}
+	p_surf_data->emissive_src.clear();
+	p_surf_data->emissive_src_counter = p_surface_counter;
+
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	if (!p_mesh_rid.is_valid() || !mesh_storage->owns_mesh(p_mesh_rid)) {
+		return; // MultiMesh/particles emitters are not gathered in v1.
+	}
+
+	// Const-qualified call: the non-const overload mesh_get_surface(RID, uint32_t)
+	// returns the internal surface pointer and would make this call ambiguous.
+	const RendererRD::MeshStorage *cms = mesh_storage;
+	RenderingServerTypes::SurfaceData sd = cms->mesh_get_surface(p_mesh_rid, (int)p_surface_index);
+	if (sd.primitive != RSE::PRIMITIVE_TRIANGLES) {
+		return;
+	}
+	// Battle-tested CPU decode of every vertex/attribute format variant.
+	Array arrays = RS::get_singleton()->mesh_create_arrays_from_surface_data(sd);
+	if (arrays.size() != RSE::ARRAY_MAX) {
+		return;
+	}
+	Vector<Vector3> positions = arrays[RSE::ARRAY_VERTEX];
+	Vector<Color> colors = arrays[RSE::ARRAY_COLOR];
+	Vector<Vector2> uvs = arrays[RSE::ARRAY_TEX_UV];
+	Vector<int> indices = arrays[RSE::ARRAY_INDEX];
+	if (positions.is_empty() || colors.is_empty() || uvs.is_empty()) {
+		// The glow formula reads COLOR (mask/edge) + UV (membrane). Without
+		// them the sampler cannot evaluate emission; such surfaces stay
+		// hit-only (MIS weight 1 via the reverse map's NONE), which is
+		// graceful, not wrong.
+		return;
+	}
+
+	auto pack_color = [](const Color &c) -> uint32_t {
+		uint32_t r = (uint32_t)CLAMP((int)Math::round(c.r * 255.0f), 0, 255);
+		uint32_t g = (uint32_t)CLAMP((int)Math::round(c.g * 255.0f), 0, 255);
+		uint32_t b = (uint32_t)CLAMP((int)Math::round(c.b * 255.0f), 0, 255);
+		uint32_t a = (uint32_t)CLAMP((int)Math::round(c.a * 255.0f), 0, 255);
+		return r | (g << 8) | (b << 16) | (a << 24); // unpackUnorm4x8 layout
+	};
+	auto pack_uv = [](const Vector2 &uv) -> uint32_t {
+		return (uint32_t)Math::make_half_float(uv.x) | ((uint32_t)Math::make_half_float(uv.y) << 16); // packHalf2x16 layout
+	};
+
+	const bool indexed = !indices.is_empty();
+	const uint32_t tri_count = (uint32_t)((indexed ? indices.size() : positions.size()) / 3);
+	const uint32_t vtx_count = (uint32_t)positions.size();
+
+	for (uint32_t t = 0; t < tri_count; t++) {
+		uint32_t i0, i1, i2;
+		if (indexed) {
+			i0 = (uint32_t)indices[t * 3 + 0];
+			i1 = (uint32_t)indices[t * 3 + 1];
+			i2 = (uint32_t)indices[t * 3 + 2];
+		} else {
+			i0 = t * 3 + 0;
+			i1 = t * 3 + 1;
+			i2 = t * 3 + 2;
+		}
+		if (i0 >= vtx_count || i1 >= vtx_count || i2 >= vtx_count) {
+			continue;
+		}
+		// COLOR.a is the emission mask and it is barycentric-linear: zero at
+		// all three vertices means zero everywhere on the triangle, so
+		// skipping here can never create an emitting-but-unsampled hole.
+		if (colors[i0].a <= 0.0f && colors[i1].a <= 0.0f && colors[i2].a <= 0.0f) {
+			continue;
+		}
+		RT_EmissiveSrcTri tri;
+		const uint32_t idx[3] = { i0, i1, i2 };
+		for (int v = 0; v < 3; v++) {
+			tri.pos[v][0] = positions[idx[v]].x;
+			tri.pos[v][1] = positions[idx[v]].y;
+			tri.pos[v][2] = positions[idx[v]].z;
+			tri.color_packed[v] = pack_color(colors[idx[v]]);
+			tri.uv_packed[v] = pack_uv(uvs[idx[v]]);
+		}
+		tri.prim_id = t;
+		p_surf_data->emissive_src.push_back(tri);
+	}
+}
+
+/// Append one surface-instance's emitters to this frame's table.
+/// World-space transform + per-instance pulse phase are applied here; power
+/// (incl. live pulse) is finalized in _finalize_emissive_table.
+void RenderRaytracing::_append_emissive_instance(RTSurfaceData *p_surf_data, const RT_MaterialData &p_mat, uint32_t p_geometry_idx, const Transform3D &p_xform) {
+	if (p_surf_data->emissive_src.is_empty()) {
+		return;
+	}
+	// Reverse-map segment sized by the surface's FULL primitive range so the
+	// lookup is a plain [prim_id] index. Segment prim_count = max prim_id + 1
+	// of cached tris would under-size sparse tails; use the last prim_id + 1.
+	const uint32_t prim_count = p_surf_data->emissive_src[p_surf_data->emissive_src.size() - 1].prim_id + 1;
+	const uint32_t seg_start = emissive_map_slots.size();
+	const uint32_t old_size = emissive_map_slots.size();
+	emissive_map_slots.resize(old_size + prim_count);
+	for (uint32_t i = 0; i < prim_count; i++) {
+		emissive_map_slots[old_size + i] = RT_EMISSIVE_NONE;
+	}
+
+	for (uint32_t s = 0; s < p_surf_data->emissive_src.size(); s++) {
+		const RT_EmissiveSrcTri &src = p_surf_data->emissive_src[s];
+		RT_EmissiveTriData e;
+		Vector3 w[3];
+		for (int v = 0; v < 3; v++) {
+			w[v] = p_xform.xform(Vector3(src.pos[v][0], src.pos[v][1], src.pos[v][2]));
+		}
+		e.pos0[0] = w[0].x;
+		e.pos0[1] = w[0].y;
+		e.pos0[2] = w[0].z;
+		e.pos1[0] = w[1].x;
+		e.pos1[1] = w[1].y;
+		e.pos1[2] = w[1].z;
+		e.pos2[0] = w[2].x;
+		e.pos2[1] = w[2].y;
+		e.pos2[2] = w[2].z;
+		for (int v = 0; v < 3; v++) {
+			e.color_packed[v] = src.color_packed[v];
+			e.uv_packed[v] = src.uv_packed[v];
+		}
+		e.geometry_idx = p_geometry_idx;
+		e.prim_id = src.prim_id;
+		e.pulse_phase = p_mat.glow_pulse_phase;
+		e.area_ws = (float)((w[1] - w[0]).cross(w[2] - w[0]).length() * 0.5);
+		e.selection_pdf = 0.0f; // filled by _finalize_emissive_table
+		e.alias_prob = 1.0f;
+		e.alias_idx = 0;
+		e._pad0 = 0.0f;
+		e._pad1 = 0.0f;
+
+		emissive_map_slots[seg_start + src.prim_id] = emissive_tri_data.size();
+		emissive_tri_data.push_back(e);
+		emissive_tri_power.push_back(0.0f); // filled in finalize
+	}
+
+	EmissiveMapSegment seg;
+	seg.geometry_idx = p_geometry_idx;
+	seg.seg_start = seg_start;
+	seg.prim_count = prim_count;
+	emissive_map_segments.push_back(seg);
+}
+
+/// Power quadrature + Vose alias table + reverse-map assembly, once per frame
+/// after the TLAS instance loop. p_time drives the live pulse: table power is
+/// exact for the frame that renders it — no staleness window at all.
+void RenderRaytracing::_finalize_emissive_table(float p_time) {
+	const uint32_t n = emissive_tri_data.size();
+	emissive_total_power = 0.0f;
+
+	// --- Per-triangle power: degree-2 edge-midpoint quadrature of the
+	// canonical glow formula. The integrand is NOT barycentric-linear
+	// (rim = pow(1-edge, rim_power); the corrected handoff explains why this
+	// still cannot create a zero-power-but-emitting triangle).
+	for (uint32_t i = 0; i < n; i++) {
+		RT_EmissiveTriData &e = emissive_tri_data[i];
+		const RT_MaterialData &md = material_data[e.geometry_idx];
+
+		// Unpack the SAME quantized values the shader will unpack.
+		float edge[3], mem[3], mask[3];
+		for (int v = 0; v < 3; v++) {
+			uint32_t c = e.color_packed[v];
+			edge[v] = (float)((c >> 16) & 0xFFu) / 255.0f; // COLOR.b
+			mask[v] = (float)((c >> 24) & 0xFFu) / 255.0f; // COLOR.a
+			mem[v] = Math::half_to_float((uint16_t)(e.uv_packed[v] >> 16)); // UV.y
+		}
+		auto glow_at = [&](float p_edge, float p_mem, float p_mask) -> float {
+			float rim = Math::pow(CLAMP(1.0f - p_edge, 0.0f, 1.0f), md.glow_rim_power);
+			return (md.glow_core_floor + rim * md.glow_rim_boost + p_mem * md.glow_membrane_boost) * p_mask;
+		};
+		// Edge midpoints (degree-2 exact for polynomials up to quadratic).
+		float mean_glow = (glow_at(0.5f * (edge[0] + edge[1]), 0.5f * (mem[0] + mem[1]), 0.5f * (mask[0] + mask[1])) +
+								  glow_at(0.5f * (edge[1] + edge[2]), 0.5f * (mem[1] + mem[2]), 0.5f * (mask[1] + mask[2])) +
+								  glow_at(0.5f * (edge[2] + edge[0]), 0.5f * (mem[2] + mem[0]), 0.5f * (mask[2] + mask[0]))) /
+				3.0f;
+
+		float pulse = 1.0f + md.glow_pulse_depth * Math::sin(p_time * (float)Math::TAU * md.glow_pulse_rate_hz + e.pulse_phase * (float)Math::TAU);
+		float lum = 0.2126f * md.glow_color[0] + 0.7152f * md.glow_color[1] + 0.0722f * md.glow_color[2];
+		float power = e.area_ws * mean_glow * md.glow_energy * lum * pulse;
+		emissive_tri_power[i] = MAX(power, 0.0f);
+		emissive_total_power += emissive_tri_power[i];
+	}
+
+	// --- Selection pdfs + Vose alias table.
+	if (n > 0 && emissive_total_power > 0.0f) {
+		LocalVector<float> scaled; // power/total * n
+		LocalVector<uint32_t> small_stack, large_stack;
+		scaled.resize(n);
+		for (uint32_t i = 0; i < n; i++) {
+			emissive_tri_data[i].selection_pdf = emissive_tri_power[i] / emissive_total_power;
+			scaled[i] = emissive_tri_data[i].selection_pdf * (float)n;
+			if (scaled[i] < 1.0f) {
+				small_stack.push_back(i);
+			} else {
+				large_stack.push_back(i);
+			}
+		}
+		while (small_stack.size() > 0 && large_stack.size() > 0) {
+			uint32_t s = small_stack[small_stack.size() - 1];
+			small_stack.resize(small_stack.size() - 1);
+			uint32_t l = large_stack[large_stack.size() - 1];
+			large_stack.resize(large_stack.size() - 1);
+			emissive_tri_data[s].alias_prob = scaled[s];
+			emissive_tri_data[s].alias_idx = l;
+			scaled[l] = (scaled[l] + scaled[s]) - 1.0f;
+			if (scaled[l] < 1.0f) {
+				small_stack.push_back(l);
+			} else {
+				large_stack.push_back(l);
+			}
+		}
+		while (large_stack.size() > 0) {
+			uint32_t l = large_stack[large_stack.size() - 1];
+			large_stack.resize(large_stack.size() - 1);
+			emissive_tri_data[l].alias_prob = 1.0f;
+			emissive_tri_data[l].alias_idx = l;
+		}
+		while (small_stack.size() > 0) { // numerical leftovers
+			uint32_t s = small_stack[small_stack.size() - 1];
+			small_stack.resize(small_stack.size() - 1);
+			emissive_tri_data[s].alias_prob = 1.0f;
+			emissive_tri_data[s].alias_idx = s;
+		}
+	}
+
+	// --- Reverse map layout (documented for the Step-3 shader lookup):
+	//   [0 .. 2*geometry_count)   header: per geometry_idx a pair
+	//                             { absolute segment offset, segment prim count }
+	//                             offset == RT_EMISSIVE_NONE -> no emitters.
+	//   [2*geometry_count .. end) segments: prim_id -> entry index or NONE.
+	// Lookup: off = map[g*2]; cnt = map[g*2+1];
+	//         entry = (off != NONE && prim_id < cnt) ? map[off + prim_id] : NONE.
+	// The count guards prim_ids beyond a surface's last emissive triangle —
+	// without it those hits would read out of the segment's bounds.
+	const uint32_t geo_count = geometry_data.size();
+	const uint32_t header_size = geo_count * 2u;
+	emissive_map_data.clear();
+	emissive_map_data.resize(header_size + emissive_map_slots.size());
+	for (uint32_t g = 0; g < header_size; g++) {
+		emissive_map_data[g] = RT_EMISSIVE_NONE;
+	}
+	for (uint32_t s = 0; s < emissive_map_segments.size(); s++) {
+		const EmissiveMapSegment &seg = emissive_map_segments[s];
+		emissive_map_data[seg.geometry_idx * 2u + 0u] = header_size + seg.seg_start;
+		emissive_map_data[seg.geometry_idx * 2u + 1u] = seg.prim_count;
+	}
+	for (uint32_t i = 0; i < emissive_map_slots.size(); i++) {
+		emissive_map_data[header_size + i] = emissive_map_slots[i];
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3286,6 +3588,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_TRI_COUNT] = float(emissive_tri_data.size());
+		if (emissive_tri_data.size() != emissive_logged_count) {
+			emissive_logged_count = emissive_tri_data.size();
+			print_line(vformat("RT emissive table: %d triangles, total power %.3f, map %d words",
+					(int)emissive_tri_data.size(), emissive_total_power, (int)emissive_map_data.size()));
+		}
 
 		// Upload light buffer.
 		{
@@ -3396,6 +3704,30 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		if (p_state->light_buffer.is_valid()) {
 			u.append_id(p_state->light_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
+		uniforms.push_back(u);
+	}
+
+	// Bindings 29/30: Emissive triangle table + reverse map (SSBOs).
+	{
+		RD::Uniform u;
+		u.binding = 29;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->emissive_tri_buffer.is_valid()) {
+			u.append_id(p_state->emissive_tri_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 30;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->emissive_map_buffer.is_valid()) {
+			u.append_id(p_state->emissive_map_buffer);
 		} else {
 			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
 		}

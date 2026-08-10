@@ -439,10 +439,45 @@ vec3 lights_evaluate_direct_lighting(
 
 // ============================================================================
 // Emissive Triangle Lights (HANDOFF_DIFFUSE_EMISSIVES)
-// Step 1 builds the host-side emitter table + reverse index; Step 2 extends
-// the reservoir selection above to draw from it. Until then this stub keeps
-// the MIS skeleton (Step 0) compiled and inert.
+// Step 1 (landed): host-assembled per-frame table + reverse map, bound below.
+// Step 2 extends the reservoir selection above to sample the table; Step 3
+// replaces the pdf stub with the reverse lookup. Until then the buffers are
+// bound but unread, and the stub keeps the MIS skeleton inert.
 // ============================================================================
+
+// Matches C++ RT_EmissiveTriData (96 B, std430, scalars only).
+struct RTEmissiveTriData {
+	float pos0_x, pos0_y, pos0_z; // world space
+	float pos1_x, pos1_y, pos1_z;
+	float pos2_x, pos2_y, pos2_z;
+	uint color_packed_0, color_packed_1, color_packed_2; // rgba8 per vertex (unpackUnorm4x8)
+	uint uv_packed_0, uv_packed_1, uv_packed_2; // 2xfp16 per vertex (unpackHalf2x16)
+	uint geometry_idx; // into geometries[]/materials[], THIS frame
+	uint prim_id;
+	float pulse_phase;
+	float area_ws;
+	// pdf INVARIANT: this is the probability the alias table actually uses.
+	// The Step-2 sampler divides by it; the Step-3 reverse lookup reports it.
+	float selection_pdf;
+	float alias_prob; // Vose: keep this entry if u < alias_prob, else alias_idx
+	uint alias_idx;
+	float _pad0;
+	float _pad1;
+};
+
+layout(set = 0, binding = 29, std430) readonly buffer EmissiveTriBuffer {
+	RTEmissiveTriData emissive_tris[];
+};
+
+// Reverse map: header of {segment offset, prim count} pairs per geometry_idx,
+// then per-geometry segments mapping prim_id -> table entry (or NONE).
+//   off = emissive_map[g * 2]; cnt = emissive_map[g * 2 + 1];
+//   entry = (off != RT_EMISSIVE_NONE && prim_id < cnt) ? emissive_map[off + prim_id] : RT_EMISSIVE_NONE;
+layout(set = 0, binding = 30, std430) readonly buffer EmissiveMapBuffer {
+	uint emissive_map[];
+};
+
+#define RT_EMISSIVE_NONE 0xFFFFFFFFu
 
 /// Reverse lookup for MIS: the solid-angle pdf with which the NEE emissive
 /// triangle sampler WOULD generate the hit described by the arguments, seen

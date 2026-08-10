@@ -132,8 +132,13 @@ struct MaterialData {
 	float glow_membrane_boost;
 	float glow_pulse_rate_hz;
 	float glow_pulse_depth;
-	float _pad_glow0;
-	float _pad_glow1;
+	// Per-INSTANCE phase, hashed CPU-side from the instance world origin in
+	// build_tlas (this materials[] entry is per TLAS instance). One source
+	// for the hit path AND the emitter table: GPU sin() on the huge hash
+	// argument would not reproduce the CPU value, and MIS energy consistency
+	// requires both sides to see the identical phase.
+	float glow_pulse_phase;
+	float _pad_glow;
 };
 
 // Material flag bits (must match RT_MAT_FLAG_* in render_raytracing.h).
@@ -151,17 +156,12 @@ const uint RT_MAT_FLAG_PT_GLOW = 32u;
 //   vertex_color: COLOR — .b edge distance, .a emission mask (.r/.g are
 //                 palette weights, unused by glow)
 //   uv:           UV    — .x growth (unused by glow), .y membrane
-// pulse phase is derived from the instance's world origin, matching the
-// raster shader's vertex-stage hash — same instance, same phase, both
-// renderers.
+// pulse phase comes from md.glow_pulse_phase — hashed CPU-side from the
+// instance world origin (same constants raster uses; see the struct note).
 // NOTE: exposure normalization (scene_data.emissive_exposure_normalization)
 // is applied by the CALLER, matching how the custom-fragment emission path
 // applies it.
 // ============================================================================
-float pt_glow_phase(vec3 instance_world_origin) {
-	return fract(sin(dot(instance_world_origin, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
-}
-
 vec3 pt_glow_evaluate(MaterialData md, vec4 vertex_color, vec2 uv, float time_s, float phase) {
 	float edge_dist = vertex_color.b;
 	float membrane = uv.y;

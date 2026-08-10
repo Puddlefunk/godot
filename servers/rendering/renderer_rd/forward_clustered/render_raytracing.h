@@ -143,9 +143,57 @@ struct alignas(16) RT_MaterialData {
 	float glow_membrane_boost;
 	float glow_pulse_rate_hz;
 	float glow_pulse_depth;
-	float _pad_glow[2];
+	// Per-INSTANCE, not per-material: written into this surface-instance's
+	// material_data[] copy during build_tlas (material_data is pushed per
+	// TLAS instance, so the copy is instance-scoped). Computed on the CPU
+	// from the instance world origin and consumed verbatim by BOTH the hit
+	// path and the emitter table — GPU sin() on the huge hash argument would
+	// not reproduce the CPU value, and phase feeding both sides from one
+	// source is what keeps MIS energy consistent. (Raster hashes the same
+	// origin on the GPU; its phase may differ from PT's — cosmetic, pulse is
+	// slow, and only visible in raster/PT A/B.)
+	float glow_pulse_phase;
+	float _pad_glow;
 };
 static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430 (was 128 before the pt_glow contract)");
+
+// Emissive triangle table entry (matches GLSL RTEmissiveTriData, std430,
+// 96 B). Assembled per frame in build_tlas from per-surface source caches —
+// geometry_idx is only meaningful within the frame that built it, which is
+// why the table is never persisted (HANDOFF_DIFFUSE_EMISSIVES Step 1).
+struct RT_EmissiveTriData {
+	float pos0[3]; // world space
+	float pos1[3];
+	float pos2[3];
+	uint32_t color_packed[3]; // per-vertex COLOR, rgba8 unorm — same quantization the attribute buffer carries
+	uint32_t uv_packed[3]; // per-vertex UV, 2xfp16 (packHalf2x16 layout)
+	uint32_t geometry_idx; // into geometries[]/materials[], THIS frame only
+	uint32_t prim_id;
+	float pulse_phase; // == materials[geometry_idx].glow_pulse_phase
+	float area_ws;
+	// pdf INVARIANT (write once, obey forever): selection_pdf is the
+	// probability the alias table below actually uses. emissive_triangle_pdf
+	// (MIS reverse lookup) and the NEE sampler must both report/consume THIS
+	// value — a stale table costs efficiency, a mismatch costs correctness.
+	float selection_pdf;
+	float alias_prob; // Vose: keep this entry if u < alias_prob, else jump to alias_idx
+	uint32_t alias_idx;
+	float _pad0;
+	float _pad1;
+};
+static_assert(sizeof(RT_EmissiveTriData) == 96, "RT_EmissiveTriData must be 96 bytes for std430");
+
+// Per-surface emissive source: object-space triangles + packed baked
+// attributes, decoded once per surface via mesh_create_arrays_from_surface_data
+// and re-assembled into world-space table entries every frame (cheap).
+struct RT_EmissiveSrcTri {
+	float pos[3][3]; // object space
+	uint32_t color_packed[3];
+	uint32_t uv_packed[3];
+	uint32_t prim_id;
+};
+
+constexpr uint32_t RT_EMISSIVE_NONE = 0xFFFFFFFFu;
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -260,6 +308,11 @@ struct RTSurfaceData {
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+	// pt_glow emitter source cache (HANDOFF_DIFFUSE_EMISSIVES Step 1).
+	// Valid while emissive_src_counter matches the surface's rt invalidation
+	// counter; empty + matching counter = surface has no emissive triangles.
+	LocalVector<RT_EmissiveSrcTri> emissive_src;
+	uint32_t emissive_src_counter = UINT32_MAX;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -381,6 +434,10 @@ struct RTViewportState {
 	uint32_t motion_transform_buffer_capacity = 0;
 
 	RID light_buffer;
+	RID emissive_tri_buffer; // RT_EmissiveTriData[], binding 29
+	uint32_t emissive_tri_buffer_capacity = 0;
+	RID emissive_map_buffer; // uint[], binding 30: [geometry_count] offsets header + prim_id->entry segments
+	uint32_t emissive_map_buffer_capacity = 0;
 	RID params_buffer;
 	RID scene_uniform_set;
 
@@ -453,6 +510,28 @@ class RenderRaytracing {
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+
+	// Emissive triangle table (HANDOFF_DIFFUSE_EMISSIVES Step 1). Assembled
+	// per frame alongside the TLAS: geometry indices drift frame to frame, so
+	// a persisted table would silently go stale — per-frame assembly from the
+	// per-surface caches is cheap (thousands of tris) and makes the staleness
+	// contract trivial: the table is always exactly current.
+	LocalVector<RT_EmissiveTriData> emissive_tri_data;
+	LocalVector<float> emissive_tri_power; // parallel scratch; alias-table input
+	struct EmissiveMapSegment {
+		uint32_t geometry_idx;
+		uint32_t seg_start; // into emissive_map_slots
+		uint32_t prim_count;
+	};
+	LocalVector<EmissiveMapSegment> emissive_map_segments;
+	LocalVector<uint32_t> emissive_map_slots; // concatenated prim_id -> entry idx (RT_EMISSIVE_NONE = not a light)
+	LocalVector<uint32_t> emissive_map_data; // final upload: header + segments
+	float emissive_total_power = 0.0f;
+	uint32_t emissive_logged_count = UINT32_MAX;
+
+	void _ensure_surface_emissive_src(RTSurfaceData *p_surf_data, RID p_mesh_rid, uint32_t p_surface_index, uint32_t p_surface_counter);
+	void _append_emissive_instance(RTSurfaceData *p_surf_data, const RT_MaterialData &p_mat, uint32_t p_geometry_idx, const Transform3D &p_xform);
+	void _finalize_emissive_table(float p_time);
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 

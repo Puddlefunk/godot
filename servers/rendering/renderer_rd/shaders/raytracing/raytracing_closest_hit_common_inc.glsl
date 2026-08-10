@@ -535,12 +535,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// this hit, the NEE triangle sampler (Step 2) and the emitter-table
 	// power (Step 1) evaluate ONE formula from the same snapshotted params —
 	// the two-copies-in-sync problem structurally cannot exist.
-	// gl_ObjectToWorldEXT[3] is the instance's world translation; the raster
-	// shader hashes the same origin for its pulse phase, so both renderers
-	// pulse identically.
+	// Phase is per-instance, hashed CPU-side into this instance's materials[]
+	// copy (see glow_pulse_phase in raytracing_data_inc.glsl).
 	if ((contract_md.flags & RT_MAT_FLAG_PT_GLOW) != 0u) {
-		float glow_phase = pt_glow_phase(gl_ObjectToWorldEXT[3]);
-		m.emissive = pt_glow_evaluate(contract_md, h.color, h.uv, scene_data_block.data.time, glow_phase) *
+		m.emissive = pt_glow_evaluate(contract_md, h.color, h.uv, scene_data_block.data.time, contract_md.glow_pulse_phase) *
 				scene_data_block.data.emissive_exposure_normalization;
 	}
 
