@@ -388,6 +388,10 @@ void main() {
 	m.specular = specular;
 	m.emissive = emission * scene_data_block.data.emissive_exposure_normalization;
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
+	// BACKLIGHT output -> thin-walled diffuse transmission lobe (Step 2b).
+	// Clamped: it is a transmission COLOR under KHR semantics, and >1 values
+	// would make the conserving front-diffuse scale in prepareBRDFData negative.
+	m.backlight = clamp(backlight, vec3(0.0), vec3(1.0));
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -470,6 +474,7 @@ void main() {
 	m.specular = mat.specular;
 	m.emissive = emissive;
 	m.normal = final_normal;
+	m.backlight = vec3(0.0); // StandardMaterial3D: no diffuse-transmission lobe in v1.
 
 #ifdef RT_DEBUG_ENABLED
 	{

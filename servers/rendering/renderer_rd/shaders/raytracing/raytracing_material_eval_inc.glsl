@@ -9,6 +9,10 @@ struct MaterialResult {
 	float specular; // Dielectric specular reflectance control [0..1], default 0.5 -> F0 = 0.04.
 	vec3 emissive;
 	vec3 normal; // Final shading normal (world space, after normal mapping).
+	// Thin-walled diffuse transmission color, from the custom shader's
+	// BACKLIGHT output (HANDOFF_DIFFUSE_EMISSIVES Step 2b). vec3(0.0) = lobe
+	// off; StandardMaterial3D hits always leave it off in v1.
+	vec3 backlight;
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -21,5 +25,6 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.specular = 0.5;
 	r.emissive = vec3(0.0);
 	r.normal = geometry_normal;
+	r.backlight = vec3(0.0);
 	return r;
 }

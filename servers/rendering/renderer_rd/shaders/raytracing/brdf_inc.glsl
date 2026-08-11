@@ -106,6 +106,7 @@ V mul(const M &m, const V &v) {
 #define DIFFUSE_TYPE 1
 #define SPECULAR_TYPE 2
 #define TRANSMISSION_TYPE 3 // Delta dielectric transmission (Fresnel reflect/refract split inside the lobe)
+#define DIFFUSE_TRANSMISSION_TYPE 4 // Thin-walled diffuse transmission (KHR_materials_diffuse_transmission), driven by BACKLIGHT
 
 // PIs
 #ifndef PI
@@ -280,6 +281,14 @@ struct MaterialProperties {
 	// Relative IOR for THIS hit (n_incident / n_transmitted). The caller resolves
 	// entering vs. exiting via front-face before filling this in.
 	float eta;
+	// Thin-walled diffuse transmission color (KHR_materials_diffuse_transmission,
+	// factor and color folded together). Sourced from the shader's BACKLIGHT
+	// output. NOT the delta 'transmissivness' above -- that field triggers the
+	// any-hit shadow pass-through (scene_raytracing_raygen.glsl any_hit) and
+	// reusing it would make backlit flesh stop casting shadows. Energy
+	// conserving: prepareBRDFData scales the front diffuse lobe down by the max
+	// component so front + back never exceed the base albedo.
+	float3 diffuseTransmission;
 };
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -1044,6 +1053,11 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	// Unpack material properties
 	data.specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
 	data.diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness);
+	// KHR_materials_diffuse_transmission energy split: what leaves through the
+	// back is taken FROM the front diffuse lobe (scalar max-component scale, so
+	// no channel of front + back can exceed the base albedo). Zero
+	// diffuseTransmission leaves this a no-op.
+	data.diffuseReflectance *= 1.0f - max(material.diffuseTransmission.x, max(material.diffuseTransmission.y, material.diffuseTransmission.z));
 
 	// Unpack 'perceptively linear' -> 'linear' -> 'squared' roughness
 	data.roughness = material.roughness;
@@ -1056,13 +1070,49 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	return data;
 }
 
+// -------------------------------------------------------------------------
+//    Local addition (5): thin-walled diffuse transmission lobe selection
+//    (HANDOFF_DIFFUSE_EMISSIVES Step 2b).
+// -------------------------------------------------------------------------
+
+// Probability with which the caller selects DIFFUSE_TRANSMISSION_TYPE over
+// the front (diffuse/specular) lobes. Deterministic from the material so the
+// sampler in shade_and_bounce and combinedBRDFPdf below CANNOT disagree --
+// this value sits on both sides of the MIS balance weight, and the two-sides-
+// sum-to-1 invariant (EMISSIVE_LIGHTS.md par.4.2) extends to it. The front
+// luminances use the SAME post-split reflectances prepareBRDFData produces.
+float diffuseTransmissionSelectProbability(MaterialProperties material) {
+	float dtLum = luminance(material.diffuseTransmission);
+	if (dtLum < 0.0001f) {
+		return 0.0f;
+	}
+	float dtMax = max(material.diffuseTransmission.x, max(material.diffuseTransmission.y, material.diffuseTransmission.z));
+	float frontLum = luminance(baseColorToDiffuseReflectance(material.baseColor, material.metalness)) * (1.0f - dtMax) +
+			luminance(baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0));
+	if (frontLum < 0.0001f) {
+		return 0.99f; // Degenerate black front: nearly always transmit, never a zero-prob lobe with nonzero value.
+	}
+	return clamp(dtLum / (dtLum + frontLum), 0.01f, 0.99f);
+}
+
+// The thin-walled BTDF value: cosine lobe on the far hemisphere, tinted by
+// the transmission color. |NdotL| because the lobe is evaluated with L on
+// the OPPOSITE side of the shading normal.
+float3 evalDiffuseTransmission(float3 N, float3 L, MaterialProperties material) {
+	return material.diffuseTransmission * (abs(dot(N, L)) * ONE_OVER_PI);
+}
+
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for direct light)
 float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// Prepare data needed for BRDF evaluation - unpack material properties and evaluate commonly used terms (e.g. Fresnel, NdotL, ...)
 	const BrdfData data = prepareBRDFData(N, L, V, material);
 
-	// Ignore V and L rays "below" the hemisphere
+	// Ignore V and L rays "below" the hemisphere. Exception: a backfacing L is
+	// exactly where the thin-walled diffuse transmission lobe lives.
 	if (data.Vbackfacing || data.Lbackfacing) {
+		if (!data.Vbackfacing && data.Lbackfacing) {
+			return evalDiffuseTransmission(N, L, material);
+		}
 		return float3(0.0f, 0.0f, 0.0f);
 	}
 
@@ -1085,8 +1135,12 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	outSpecular = float3(0.0f, 0.0f, 0.0f);
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
-	// Ignore L rays "below" the hemisphere
+	// Ignore L rays "below" the hemisphere -- except that is exactly where the
+	// thin-walled diffuse transmission lobe lives (reported in the diffuse
+	// slot: it is a diffuse-lobe sibling, and the NEE callers weight the two
+	// slots identically).
 	if (data.Lbackfacing) {
+		outDiffuse = evalDiffuseTransmission(N, L, material);
 		return;
 	}
 
@@ -1172,6 +1226,15 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 			// the pt_absorption contract input, not from a surface weight.
 			sampleWeight = material.baseColor;
 		}
+	} else if (brdfType == DIFFUSE_TRANSMISSION_TYPE) {
+		// Thin-walled diffuse transmission: cosine-weighted hemisphere on the
+		// FAR side of the shading normal. The cos/PI term cancels against the
+		// cosine-hemisphere pdf exactly as in the DIFFUSE_TYPE branch, leaving
+		// the transmission color as the whole weight. No interior chord, no
+		// refraction bend -- thin-walled by definition (Step 2b).
+		rayDirectionLocal = sampleHemisphere(u);
+		rayDirectionLocal.z = -rayDirectionLocal.z;
+		sampleWeight = material.diffuseTransmission;
 	}
 
 	// Transform sampled direction Llocal back to V vector space.
@@ -1187,10 +1250,10 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	// Prevent tracing direction "under" the hemisphere (behind the triangle).
 	// The caller is expected to handle this case: either terminate the path,
 	// or mirror the direction across the geometry plane to keep it above.
-	// Transmission is EXEMPT -- refracted rays legitimately continue below
-	// the geometry plane; rejecting (or mirroring) them here silently turns
-	// glass into a mirror.
-	if (brdfType != TRANSMISSION_TYPE && dot(geometryNormal, rayDirection) <= 0.0f) {
+	// Both transmission lobes are EXEMPT -- their rays legitimately continue
+	// below the geometry plane; rejecting (or mirroring) them here silently
+	// turns glass into a mirror (or a backlit membrane into a wall).
+	if (brdfType != TRANSMISSION_TYPE && brdfType != DIFFUSE_TRANSMISSION_TYPE && dot(geometryNormal, rayDirection) <= 0.0f) {
 		return false;
 	}
 
@@ -1216,8 +1279,17 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 float combinedBRDFPdf(float3 N, float3 V, float3 L, MaterialProperties material, float specularProbability) {
 	float NdotL = dot(N, L);
 	float NdotV = dot(N, V);
-	if (NdotL <= 0.0f || NdotV <= 0.0f) {
+	if (NdotV <= 0.0f) {
 		return 0.0f;
+	}
+	// Lobe-selection split between the thin-walled diffuse transmission lobe
+	// and the front lobes. Deterministic from the material (see the helper) so
+	// this pdf and the sampler's actual selection cannot drift apart.
+	float dtProb = diffuseTransmissionSelectProbability(material);
+	if (NdotL <= 0.0f) {
+		// Below the shading hemisphere: only the transmission lobe samples
+		// here -- cosine-weighted on the far side.
+		return dtProb * (-NdotL) * ONE_OVER_PI;
 	}
 	float diffusePdf = NdotL * ONE_OVER_PI;
 	float specPdf = 0.0f;
@@ -1232,7 +1304,7 @@ float combinedBRDFPdf(float3 N, float3 V, float3 L, MaterialProperties material,
 		// this stays correct if the distribution selection changes.
 		specPdf = specularPdf(alpha, alphaSquared, NdotH, NdotV, LdotH);
 	}
-	return lerp(diffusePdf, specPdf, specularProbability);
+	return (1.0f - dtProb) * lerp(diffusePdf, specPdf, specularProbability);
 }
 
 // -------------------------------------------------------------------------

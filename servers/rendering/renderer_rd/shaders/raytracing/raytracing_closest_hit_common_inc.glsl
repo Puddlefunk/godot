@@ -468,6 +468,7 @@ void debug_visualize(
 		dbg_mat.transmissivness = 0.0;
 		dbg_mat.eta = 1.0;
 		dbg_mat.opacity = 1.0;
+		dbg_mat.diffuseTransmission = vec3(0.0);
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -588,10 +589,17 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.transmissivness = 0.0;
 	brdf_mat.opacity = 1.0;
 	brdf_mat.eta = 1.0;
+	// Thin-walled diffuse transmission (Step 2b), from the shader's BACKLIGHT
+	// output. Deliberately NOT contract_md.transmission: that field makes the
+	// shadow any-hit pass through, and backlit flesh must keep casting shadows.
+	brdf_mat.diffuseTransmission = m.backlight;
 
 	// Consume the transmission contract.
 	brdf_mat.transmissivness = contract_md.transmission;
 	if (contract_md.transmission > 0.0) {
+		// Delta dielectric wins outright; mixing the two transmission models
+		// on one surface is not supported (and the NEE gate below assumes it).
+		brdf_mat.diffuseTransmission = vec3(0.0);
 		// Delta lobes only, no rough refraction -- force the record smooth so
 		// the guides and the lobe agree.
 		brdf_mat.roughness = 0.0;
@@ -699,10 +707,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// (Step 2b's thin-walled diffuse lobe is NEE-compatible and must NOT be
 	// caught by this gate when it lands — key it on the DELTA lobe.)
 	if ((rt_light_count > 0u || rt_emissive_count > 0u) && brdf_mat.transmissivness == 0.0) {
-		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
+		// RAW hit position: the lights code offsets each shadow-ray origin
+		// per sample along ±geometry_normal, because diffuse-transmission
+		// samples (Step 2b) leave through the BACK of the surface and a
+		// front-offset origin would self-occlude on the surface's own
+		// triangle.
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count,
+				h.hit_pos, h.geometry_normal, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count,
 				rt_emissive_count, get_rt_param(RT_PARAM_EMISSIVE_POOL_PROB), specular_select_p);
 		ps.radiance += ps.throughput * direct_light;
 	}
@@ -711,23 +723,36 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// BRDF importance sampling for next bounce
 	// =================================================================
 	int brdfType;
+	// Thin-walled diffuse transmission is drawn FIRST, against the front lobes
+	// as a whole. The probability comes from the shared brdf_inc helper -- the
+	// same value combinedBRDFPdf folds into both MIS sides, so sampler and pdf
+	// cannot drift (EMISSIVE_LIGHTS.md par.4 invariant 2 extended).
+	float dt_select_p = diffuseTransmissionSelectProbability(brdf_mat);
 	if (brdf_mat.transmissivness > 0.0) {
 		// Transmissive surface: the two-way split becomes three-way. For a full
 		// delta dielectric the Fresnel reflect/refract choice lives INSIDE the
 		// lobe, so there is no selection probability to divide out here.
 		// Partial transmission mixing diffuse/specular is not handled yet.
 		brdfType = TRANSMISSION_TYPE;
-	} else if (specular_select_p >= 1.0) {
-		brdfType = SPECULAR_TYPE;
-	} else if (specular_select_p <= 0.0) {
-		brdfType = DIFFUSE_TYPE;
+	} else if (dt_select_p > 0.0 && rand(ps.rng_state) < dt_select_p) {
+		brdfType = DIFFUSE_TRANSMISSION_TYPE;
+		ps.throughput /= dt_select_p;
 	} else {
-		if (rand(ps.rng_state) < specular_select_p) {
+		if (dt_select_p > 0.0) {
+			ps.throughput /= (1.0 - dt_select_p);
+		}
+		if (specular_select_p >= 1.0) {
 			brdfType = SPECULAR_TYPE;
-			ps.throughput /= specular_select_p;
-		} else {
+		} else if (specular_select_p <= 0.0) {
 			brdfType = DIFFUSE_TYPE;
-			ps.throughput /= (1.0 - specular_select_p);
+		} else {
+			if (rand(ps.rng_state) < specular_select_p) {
+				brdfType = SPECULAR_TYPE;
+				ps.throughput /= specular_select_p;
+			} else {
+				brdfType = DIFFUSE_TYPE;
+				ps.throughput /= (1.0 - specular_select_p);
+			}
 		}
 	}
 
@@ -742,11 +767,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		//      mirror is gated by RT_BELOW_HEMISPHERE_RECOVERY_ENABLED; when
 		//      disabled, recovery returns false and we terminate the path.
 		vec3 recovered_dir;
-		// Never mirror-recover a transmission sample: mirroring a refracted
-		// direction back above the plane is exactly the "glass becomes a mirror"
-		// failure. Terminate instead. This can only happen on a zero-weight
-		// sample; the lobe itself never fails the plane check.
-		if (brdfType == TRANSMISSION_TYPE ||
+		// Never mirror-recover a transmission sample (either lobe): mirroring a
+		// through-the-surface direction back above the plane is exactly the
+		// "glass becomes a mirror" failure. Terminate instead. This can only
+		// happen on a zero-weight sample; the lobes never fail the plane check.
+		if (brdfType == TRANSMISSION_TYPE || brdfType == DIFFUSE_TRANSMISSION_TYPE ||
 				luminance(brdf_weight) == 0.0 ||
 				!recoverBelowHemisphereSample(next_dir, h.geometry_normal, recovered_dir)) {
 			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
@@ -758,7 +783,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	ps.throughput *= brdf_weight;
 
-	if (brdfType == DIFFUSE_TYPE) {
+	if (brdfType == DIFFUSE_TYPE || brdfType == DIFFUSE_TRANSMISSION_TYPE) {
+		// Diffuse transmission is a diffuse-lobe sibling: same variance
+		// character, same reason to be depth-limited.
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {
 		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);

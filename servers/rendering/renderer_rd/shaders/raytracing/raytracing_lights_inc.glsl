@@ -374,8 +374,12 @@ float emissive_triangle_pdf(uint geometry_idx, uint prim_id, vec3 ray_origin, ve
 /// barycentric (the rim→cap→tip ramp survives sampling exactly), per-channel
 /// shadow transmittance, MIS balance weight against BSDF sampling.
 /// Returns the fully weighted, pdf-divided contribution.
+/// hit_pos is the RAW hit position; the shadow-ray origin is offset per
+/// sample along ±geo_n depending on which side of the surface L leaves
+/// through (Step 2b: back-side samples feed the diffuse-transmission lobe).
 vec3 lights_sample_emissive_triangle(
 		vec3 hit_pos,
+		vec3 geo_n,
 		vec3 N,
 		vec3 V,
 		MaterialProperties material,
@@ -410,7 +414,11 @@ vec3 lights_sample_emissive_triangle(
 	float dist = sqrt(dist_sq);
 	vec3 L = to_p / dist;
 
-	if (dot(N, L) <= 0.0) {
+	// Back-side samples are rejected UNLESS the material carries the
+	// thin-walled diffuse-transmission lobe -- then they are exactly the
+	// membrane-lit-from-behind case this sampler exists for (Step 2b), and
+	// evalCombinedBRDFSeparate below returns the BTDF for them.
+	if (dot(N, L) <= 0.0 && luminance(material.diffuseTransmission) <= 0.0) {
 		return vec3(0.0);
 	}
 
@@ -443,8 +451,12 @@ vec3 lights_sample_emissive_triangle(
 	}
 
 	// Per-channel transmittance: mushroom light through a crystal arrives
-	// tinted, for free.
-	vec3 shadow_transmittance = lights_trace_shadow_ray(hit_pos, L, dist, rng_state);
+	// tinted, for free. Origin offset follows the side L exits through: a
+	// back-side (transmission) sample offset to the FRONT would immediately
+	// re-cross its own triangle and self-occlude. Front samples get the
+	// identical origin the pre-2b code used.
+	vec3 shadow_origin = offset_ray_origin(hit_pos, (dot(L, geo_n) >= 0.0) ? geo_n : -geo_n);
+	vec3 shadow_transmittance = lights_trace_shadow_ray(shadow_origin, L, dist, rng_state);
 	if (all(lessThan(shadow_transmittance, vec3(0.0001)))) {
 		return vec3(0.0);
 	}
@@ -466,8 +478,11 @@ vec3 lights_sample_emissive_triangle(
 // one sample per call, drawn from the analytic pool (mini-batch reservoir,
 // as ever) or the emissive triangle pool (alias table), chosen by the
 // host-computed power ratio in emissive_pool_prob.
+// hit_pos is the RAW hit position; shadow-ray origins are offset per sample
+// along ±geo_n by the side L exits through (see lights_sample_emissive_triangle).
 vec3 lights_evaluate_direct_lighting(
 		vec3 hit_pos,
+		vec3 geo_n,
 		vec3 N,
 		vec3 V,
 		MaterialProperties material,
@@ -495,7 +510,7 @@ vec3 lights_evaluate_direct_lighting(
 		// NOTE: p_light inside the helper already includes pool_e — it is
 		// the FULL pdf, so no further division here (and the hit-side
 		// reverse lookup reports the same full pdf; the twins must agree).
-		return lights_sample_emissive_triangle(hit_pos, N, V, material, rng_state, specular_select_p, emissive_tri_count, pool_e);
+		return lights_sample_emissive_triangle(hit_pos, geo_n, N, V, material, rng_state, specular_select_p, emissive_tri_count, pool_e);
 	}
 	float analytic_inv_prob = 1.0 / (1.0 - pool_e);
 
@@ -577,8 +592,11 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		// Per-channel transmittance, not a binary visibility test.
-		vec3 shadow_transmittance = lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state);
+		// Per-channel transmittance, not a binary visibility test. Origin
+		// offset follows the side L exits through (diffuse transmission
+		// samples leave through the back).
+		vec3 shadow_origin = offset_ray_origin(hit_pos, (dot(L, geo_n) >= 0.0) ? geo_n : -geo_n);
+		vec3 shadow_transmittance = lights_trace_shadow_ray(shadow_origin, L, shadow_dist, rng_state);
 		if (all(lessThan(shadow_transmittance, vec3(0.0001)))) {
 			return vec3(0.0);
 		}
@@ -608,12 +626,16 @@ vec3 lights_evaluate_direct_lighting(
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
 
 		float NdotL = dot(N, L);
-		if (NdotL <= 0.0) {
+		// Back-side rejection relaxed for the diffuse-transmission lobe
+		// (Step 2b): sun through a membrane is this exact path.
+		if (NdotL <= 0.0 && luminance(material.diffuseTransmission) <= 0.0) {
 			return vec3(0.0);
 		}
 
-		// Per-channel transmittance, not a binary visibility test.
-		vec3 shadow_transmittance = lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state);
+		// Per-channel transmittance, not a binary visibility test. Origin
+		// offset follows the side L exits through.
+		vec3 shadow_origin = offset_ray_origin(hit_pos, (dot(L, geo_n) >= 0.0) ? geo_n : -geo_n);
+		vec3 shadow_transmittance = lights_trace_shadow_ray(shadow_origin, L, ls.max_distance, rng_state);
 		if (all(lessThan(shadow_transmittance, vec3(0.0001)))) {
 			return vec3(0.0);
 		}
