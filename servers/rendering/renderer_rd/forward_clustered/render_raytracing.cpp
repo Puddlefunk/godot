@@ -650,9 +650,21 @@ RTSurfaceData *RenderRaytracing::process_surface(
 			entry->cached_counter != p_surface_invalidation_counter;
 
 	if (!needs_refresh && entry->ptr->blas.is_valid()) {
-		cache_hits++;
-		entry->last_used_frame = current_frame;
-		return entry->ptr;
+		// The BLAS must still be LIVE, not merely non-null. A mesh RID can be
+		// kept and its surfaces re-created in place (mesh_clear +
+		// add_surface — the voxel regen pattern): freeing the old surface
+		// buffers cascade-frees this BLAS through RD's dependency map while
+		// version and counter still match. A hit on a dangling BLAS pushes a
+		// dead RID into the TLAS instance list (aborting tlas_build and
+		// leaving the TLAS invalidated for the trace) and reuses stale BDA
+		// addresses in RT_GeometryData — a GPU use-after-free the RID layer
+		// cannot see. Treat it as a miss and rebuild.
+		if (RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+			cache_hits++;
+			entry->last_used_frame = current_frame;
+			return entry->ptr;
+		}
+		entry->ptr->blas = RID();
 	}
 
 	cache_misses++;
@@ -661,11 +673,17 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
 	} else if (entry->ptr->blas.is_valid()) {
-		if (entry->cached_rid_version == mesh_version) {
-			// Same mesh, surface data changed: BLAS is still live, free explicitly.
+		if (entry->cached_rid_version == mesh_version &&
+				RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
+			// Same mesh, surface data changed, BLAS still live: free explicitly.
+			// The liveness check matters: surface re-creation on a kept mesh RID
+			// cascade-frees the BLAS with the version unchanged, and freeing it
+			// again here was the source of the "Attempted to free invalid ID"
+			// floods during level-exit regen (stale RIDs of consecutive slots,
+			// validators a few generations ahead).
 			RD::get_singleton()->free_rid(entry->ptr->blas);
 		}
-		// Version mismatch: old mesh was deleted, BLAS already cascade-freed by RD.
+		// Version mismatch / already cascade-freed: nothing to free here.
 		entry->ptr->blas = RID();
 	}
 
@@ -1499,7 +1517,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.glow_pulse_rate_hz = 0.0f;
 	mat.glow_pulse_depth = 0.0f;
 	mat.glow_pulse_phase = 0.0f; // per-instance; written in build_tlas, not here
-	mat._pad_glow = 0.0f;
+	// ORM packing (roughness=G, metallic=B) — the pre-field hardcoded behavior.
+	mat.texture_channels = 1u | (2u << 4);
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1832,6 +1851,60 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.roughness = roughness_var;
 	}
 
+	// Texture channel selectors. BaseMaterial3D exposes *_texture_channel as a
+	// vec4 dot-mask shader param (Color from _get_texture_mask); pack it down
+	// to an index the hit shader can branch on. Materials without the param
+	// (ORM materials, custom shaders) keep the ORM defaults set above
+	// (roughness=G, metallic=B). Raster always honoured these masks; the hit
+	// shader hardcoding orm.g/orm.b was only benign for grayscale maps.
+	{
+		auto snapshot_channel = [&](const StringName &p_param, uint32_t p_default) -> uint32_t {
+			Variant v = material_storage->material_get_param(p_material_rid, p_param);
+			float m[4];
+			if (v.get_type() == Variant::COLOR) {
+				Color c = v;
+				m[0] = c.r;
+				m[1] = c.g;
+				m[2] = c.b;
+				m[3] = c.a;
+			} else if (v.get_type() == Variant::VECTOR4) {
+				Vector4 c = v;
+				m[0] = c.x;
+				m[1] = c.y;
+				m[2] = c.z;
+				m[3] = c.w;
+			} else if (v.get_type() == Variant::PLANE) {
+				Plane p = v;
+				m[0] = p.normal.x;
+				m[1] = p.normal.y;
+				m[2] = p.normal.z;
+				m[3] = p.d;
+			} else if (v.get_type() == Variant::QUATERNION) {
+				Quaternion q = v;
+				m[0] = q.x;
+				m[1] = q.y;
+				m[2] = q.z;
+				m[3] = q.w;
+			} else {
+				return p_default;
+			}
+			// Grayscale mask is (1/3, 1/3, 1/3, 0): more than one positive rgb
+			// component means the weighted-average channel.
+			if (m[0] > 0.0f && m[1] > 0.0f) {
+				return 4u;
+			}
+			uint32_t best = 0;
+			for (uint32_t i = 1; i < 4; i++) {
+				if (m[i] > m[best]) {
+					best = i;
+				}
+			}
+			return best;
+		};
+		mat.texture_channels = snapshot_channel("roughness_texture_channel", 1u) |
+				(snapshot_channel("metallic_texture_channel", 2u) << 4);
+	}
+
 	Variant specular_var = material_storage->material_get_param(p_material_rid, "specular");
 	if (specular_var.get_type() == Variant::FLOAT) {
 		mat.specular = specular_var;
@@ -1945,9 +2018,18 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 	}
 
 	LocalVector<RD::AccelerationStructureInstance> instances;
-	instances.resize(blass.size());
+	instances.reserve(blass.size());
 	for (uint32_t i = 0; i < blass.size(); i++) {
-		RD::AccelerationStructureInstance &inst = instances[i];
+		// Last line of defense: one stale BLAS (freed under a cache between
+		// surface processing and here) would make tlas_build ERR_FAIL out
+		// wholesale, leaving the TLAS invalidated for this frame's trace.
+		// Skip the instance instead; `id` keeps the ORIGINAL index so
+		// gl_InstanceCustomIndexEXT still lines up with geometry_data[].
+		if (!RD::get_singleton()->acceleration_structure_is_valid(blass[i])) {
+			WARN_PRINT_ONCE("RT: skipped TLAS instance whose BLAS was freed mid-frame (stale surface cache?).");
+			continue;
+		}
+		RD::AccelerationStructureInstance inst;
 		inst.id = i;
 		inst.transform = blas_transforms[i];
 		inst.blas = blass[i];
@@ -1955,6 +2037,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.mask = (i < instance_masks.size()) ? instance_masks[i] : 0xFF;
 		uint32_t sbt_off = (i < sbt_offsets.size()) ? sbt_offsets[i] : 0;
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
+		instances.push_back(inst);
 	}
 
 	RD::get_singleton()->tlas_build(p_state->tlas, instances);

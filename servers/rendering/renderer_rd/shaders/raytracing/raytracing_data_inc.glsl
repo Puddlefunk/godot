@@ -138,7 +138,12 @@ struct MaterialData {
 	// argument would not reproduce the CPU value, and MIS energy consistency
 	// requires both sides to see the identical phase.
 	float glow_pulse_phase;
-	float _pad_glow;
+	// Texture channel selectors, packed (former padding; struct size
+	// unchanged): bits 0-3 roughness, bits 4-7 metallic, values 0=R 1=G 2=B
+	// 3=A 4=grayscale. Defaults to ORM packing (roughness=G, metallic=B) —
+	// exactly what the hit shader hardcoded before this field existed.
+	// Snapshotted from BaseMaterial3D's *_texture_channel vec4 masks.
+	uint texture_channels;
 };
 
 // Material flag bits (must match RT_MAT_FLAG_* in render_raytracing.h).

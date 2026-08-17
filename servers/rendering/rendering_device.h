@@ -1419,6 +1419,13 @@ public:
 	Error blas_build(RID p_blas);
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
+	// True while the RID refers to a live BLAS/TLAS. Mirrors
+	// uniform_set_is_valid: acceleration structures are cascade-freed through
+	// the dependency map when a buffer they were built from dies (e.g. mesh
+	// surfaces re-created in place), so any cached AS RID can go stale without
+	// its holder freeing it. RID::is_valid() only checks non-null; callers
+	// holding cached AS RIDs must use this before freeing or rebuilding on top.
+	bool acceleration_structure_is_valid(RID p_acceleration_structure);
 
 private:
 	/**********************************/

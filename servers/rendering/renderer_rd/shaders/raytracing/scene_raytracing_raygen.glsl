@@ -428,6 +428,7 @@ void main() {
 	tc.pos = vec3(0.0);
 	tc.tangent = vec3(1.0, 0.0, 0.0);
 	tc.binormal = vec3(0.0, 0.0, 1.0);
+	tc.uv_width = vec3(0.0);
 	if (triplanar) {
 		tc = compute_triplanar_coords(h, mat, geometries[h.geometry_idx]);
 	}
@@ -451,11 +452,18 @@ void main() {
 			? sample_material_texture_triplanar(mat.albedo_texture_idx, tc, mat.flags)
 			: sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = (triplanar
+	vec4 orm_tex = triplanar
 			? sample_material_texture_triplanar(mat.orm_texture_idx, tc, mat.flags)
-			: sample_material_texture(mat.orm_texture_idx, uv, mat.flags)).rgb;
-	float roughness = saturate(orm.g * mat.roughness);
-	float metalness = saturate(orm.b * mat.metallic);
+			: sample_material_texture(mat.orm_texture_idx, uv, mat.flags);
+	vec3 orm = orm_tex.rgb;
+	// Channel selectors, packed host-side (bits 0-3 roughness, bits 4-7
+	// metallic; 0=R 1=G 2=B 3=A 4=grayscale). Raster honours BaseMaterial3D's
+	// roughness/metallic_texture_channel; this used to hardcode orm.g/orm.b,
+	// which was only correct for true ORM packing — a standalone map authored
+	// on another channel (the game's roughness maps use RED) read the wrong
+	// data, benign today purely because those PNGs are grayscale.
+	float roughness = saturate(rt_channel_sample(orm_tex, mat.texture_channels & 15u) * mat.roughness);
+	float metalness = saturate(rt_channel_sample(orm_tex, (mat.texture_channels >> 4u) & 15u) * mat.metallic);
 
 	vec3 emissive = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
