@@ -525,14 +525,28 @@ class RenderRaytracing {
 	// millions" was wrong — a streamed-in field is ~400k emissive triangles
 	// (~40 MB of table). Rebuilding and re-uploading that per frame is real
 	// CPU + PCIe cost, so assembly is FINGERPRINT-GATED: the per-frame loop
-	// only collects pending instances (cheap, O(instances)) and hashes
-	// membership, geometry indices, transforms, surface versions and glow
-	// params. The table is rebuilt only when the hash changes. Pulse-stale
-	// powers between rebuilds are safe BY THE PDF INVARIANT — the table's
-	// selection_pdf is simultaneously what the sampler divides by and what
-	// the reverse lookup reports, so staleness costs sampling efficiency
-	// (±pulse_depth wobble), never correctness; radiance is evaluated live
-	// from TIME either way.
+	// only collects pending instances (cheap, O(instances)) and hashes the
+	// table's STRUCTURE — membership, order, geometry indices, surface
+	// versions and the glow knobs. The full rebuild runs only when that
+	// hash changes. Pulse-stale powers between rebuilds are safe BY THE PDF
+	// INVARIANT — the table's selection_pdf is simultaneously what the
+	// sampler divides by and what the reverse lookup reports, so staleness
+	// costs sampling efficiency (±pulse_depth wobble), never correctness;
+	// radiance is evaluated live from TIME either way.
+	//
+	// MOTION is incremental (17 Aug): transforms and pulse phase are
+	// deliberately NOT in the fingerprint any more. The first live cliff:
+	// a held mushroom is parented to the CAMERA, so its transform changed
+	// every frame, and hashing transforms meant the whole ~400k-tri table
+	// was re-assembled and re-uploaded per frame (measured 66→9 fps while
+	// carrying one). Now a moved instance re-transforms only its own
+	// contiguous segment of the table (layout is unchanged when structure
+	// is unchanged) and uploads only that byte range. Its powers are
+	// refreshed but the GLOBAL pdf/alias table is left stale — safe by the
+	// pdf invariant above — until accumulated |Δpower| crosses a fraction
+	// of total power, at which point one full pdf+alias refresh and full
+	// upload runs. One moving lantern in a big field never gets near the
+	// threshold; teleporting half the field across the map does.
 	struct EmissivePendingInstance {
 		RTSurfaceData *surf_data = nullptr;
 		uint32_t geometry_idx = 0;
@@ -541,6 +555,26 @@ class RenderRaytracing {
 	LocalVector<EmissivePendingInstance> emissive_pending;
 	uint64_t emissive_fingerprint_last = 0;
 	bool emissive_table_dirty = false;
+
+	// Last full build, per instance: where its tris live in the table and
+	// the transform they were built with. Parallel to emissive_pending
+	// whenever the structure fingerprint matches (same membership + order).
+	struct EmissiveBuiltInstance {
+		RTSurfaceData *surf_data = nullptr;
+		uint32_t geometry_idx = 0;
+		uint32_t tri_start = 0; // into emissive_tri_data, contiguous
+		uint32_t tri_count = 0; // == surf_data->emissive_src.size() at build
+		Transform3D xform; // exact values the segment was transformed by
+	};
+	LocalVector<EmissiveBuiltInstance> emissive_built;
+	struct EmissiveDirtyRange {
+		uint32_t tri_start;
+		uint32_t tri_count;
+	};
+	// Segments re-transformed this frame; consumed by finalize_buffers as
+	// partial buffer_update ranges, cleared in prepare_frame.
+	LocalVector<EmissiveDirtyRange> emissive_dirty_ranges;
+	float emissive_power_drift = 0.0f; // |Δpower| since last pdf/alias build
 
 	LocalVector<RT_EmissiveTriData> emissive_tri_data;
 	LocalVector<float> emissive_tri_power; // parallel scratch; alias-table input
@@ -557,6 +591,7 @@ class RenderRaytracing {
 
 	void _ensure_surface_emissive_src(RTSurfaceData *p_surf_data, RID p_mesh_rid, uint32_t p_surface_index, uint32_t p_surface_counter);
 	void _append_emissive_instance(RTSurfaceData *p_surf_data, const RT_MaterialData &p_mat, uint32_t p_geometry_idx, const Transform3D &p_xform);
+	void _rebuild_emissive_alias();
 	void _finalize_emissive_table(float p_time);
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;

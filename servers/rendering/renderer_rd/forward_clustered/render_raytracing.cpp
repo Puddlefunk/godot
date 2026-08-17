@@ -534,6 +534,7 @@ void RenderRaytracing::prepare_frame() {
 	merged_mm_active_this_frame.clear();
 	emissive_pending.clear();
 	emissive_table_dirty = false;
+	emissive_dirty_ranges.clear();
 	// NOTE: the emissive table arrays are NOT cleared here — they persist
 	// across frames and are rebuilt only when the fingerprint changes (see
 	// _finalize_emissive_table).
@@ -2073,13 +2074,32 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
 	// Upload on fingerprint change, or into a viewport state that has never
 	// received the table (fresh state while the global table is clean).
-	if (emissive_table_dirty || (!p_state->emissive_tri_buffer.is_valid() && !emissive_tri_data.is_empty())) {
+	const uint32_t emissive_tri_bytes = emissive_tri_data.size() * (uint32_t)sizeof(RT_EmissiveTriData);
+	const bool emissive_state_stale = !emissive_tri_data.is_empty() &&
+			(!p_state->emissive_tri_buffer.is_valid() || p_state->emissive_tri_buffer_capacity < emissive_tri_bytes);
+	if (emissive_table_dirty || emissive_state_stale) {
 		// ~40 MB at field scale — never a steady per-frame cost (see the
 		// emissive members in the header).
 		update_or_grow(p_state->emissive_tri_buffer, p_state->emissive_tri_buffer_capacity,
-				emissive_tri_data.ptr(), emissive_tri_data.size() * sizeof(RT_EmissiveTriData));
+				emissive_tri_data.ptr(), emissive_tri_bytes);
 		update_or_grow(p_state->emissive_map_buffer, p_state->emissive_map_buffer_capacity,
 				emissive_map_data.ptr(), emissive_map_data.size() * sizeof(uint32_t));
+	} else if (!emissive_dirty_ranges.is_empty()) {
+		// Incremental motion path: only the moved instances' segments
+		// changed. Segments are contiguous by construction (appended per
+		// instance) and the layout is unchanged since the last full build,
+		// so the byte offsets are valid in the existing buffer. The reverse
+		// map depends only on layout — untouched, nothing to upload there.
+		// (Like the full path, this addresses the state that rendered this
+		// frame; a second viewport state would refresh on its own frame's
+		// finalize, same contract as before.)
+		for (uint32_t r = 0; r < emissive_dirty_ranges.size(); r++) {
+			const EmissiveDirtyRange &range = emissive_dirty_ranges[r];
+			RD::get_singleton()->buffer_update(p_state->emissive_tri_buffer,
+					range.tri_start * (uint32_t)sizeof(RT_EmissiveTriData),
+					range.tri_count * (uint32_t)sizeof(RT_EmissiveTriData),
+					&emissive_tri_data[range.tri_start]);
+		}
 	}
 }
 
@@ -3247,10 +3267,46 @@ void RenderRaytracing::_append_emissive_instance(RTSurfaceData *p_surf_data, con
 /// reverse-map assembly. The fingerprint hashes everything the table depends
 /// on except TIME; pulse-stale powers between rebuilds are safe by the pdf
 /// invariant (see the member comment in the header).
+/// Degree-2 edge-midpoint quadrature of the canonical glow formula for one
+/// table entry. The integrand is NOT barycentric-linear (rim = pow(1-edge,
+/// rim_power); the corrected handoff explains why this still cannot create a
+/// zero-power-but-emitting triangle). Shared by the full rebuild and the
+/// incremental motion path so a moved segment's powers are computed by the
+/// exact same rule they were built with.
+static float _rt_emissive_tri_power(const RT_EmissiveTriData &p_tri, const RT_MaterialData &p_mat, float p_time) {
+	// Unpack the SAME quantized values the shader will unpack.
+	float edge[3], mem[3], mask[3];
+	for (int v = 0; v < 3; v++) {
+		uint32_t c = p_tri.color_packed[v];
+		edge[v] = (float)((c >> 16) & 0xFFu) / 255.0f; // COLOR.b
+		mask[v] = (float)((c >> 24) & 0xFFu) / 255.0f; // COLOR.a
+		mem[v] = Math::half_to_float((uint16_t)(p_tri.uv_packed[v] >> 16)); // UV.y
+	}
+	auto glow_at = [&](float p_edge, float p_mem, float p_mask) -> float {
+		float rim = Math::pow(CLAMP(1.0f - p_edge, 0.0f, 1.0f), p_mat.glow_rim_power);
+		return (p_mat.glow_core_floor + rim * p_mat.glow_rim_boost + p_mem * p_mat.glow_membrane_boost) * p_mask;
+	};
+	// Edge midpoints (degree-2 exact for polynomials up to quadratic).
+	float mean_glow = (glow_at(0.5f * (edge[0] + edge[1]), 0.5f * (mem[0] + mem[1]), 0.5f * (mask[0] + mask[1])) +
+							  glow_at(0.5f * (edge[1] + edge[2]), 0.5f * (mem[1] + mem[2]), 0.5f * (mask[1] + mask[2])) +
+							  glow_at(0.5f * (edge[2] + edge[0]), 0.5f * (mem[2] + mem[0]), 0.5f * (mask[2] + mask[0]))) /
+			3.0f;
+
+	float pulse = 1.0f + p_mat.glow_pulse_depth * Math::sin(p_time * (float)Math::TAU * p_mat.glow_pulse_rate_hz + p_tri.pulse_phase * (float)Math::TAU);
+	float lum = 0.2126f * p_mat.glow_color[0] + 0.7152f * p_mat.glow_color[1] + 0.0722f * p_mat.glow_color[2];
+	float power = p_tri.area_ws * mean_glow * p_mat.glow_energy * lum * pulse;
+	return MAX(power, 0.0f);
+}
+
 void RenderRaytracing::_finalize_emissive_table(float p_time) {
-	// FNV-1a over the pending set: membership, order, geometry indices,
-	// transforms (exact bytes: any movement rebuilds), surface cache
-	// versions, and the glow params + phase of each instance's material.
+	// FNV-1a STRUCTURE fingerprint over the pending set: membership, order,
+	// geometry indices, surface cache versions, and the glow KNOBS (10
+	// floats — pulse_phase deliberately excluded: it is derived from the
+	// instance's origin, so a moving instance would re-dirty it every
+	// frame). Transforms are NOT hashed — motion takes the incremental
+	// path below instead of forcing a full rebuild. (17 Aug: a camera-
+	// parented held mushroom re-dirtied the whole ~400k-tri table every
+	// frame; measured 66→9 fps while carrying.)
 	uint64_t fp = 0xcbf29ce484222325ULL;
 	auto fnv = [&fp](const void *p_data, size_t p_len) {
 		const uint8_t *b = (const uint8_t *)p_data;
@@ -3263,74 +3319,158 @@ void RenderRaytracing::_finalize_emissive_table(float p_time) {
 		fnv(&pend.geometry_idx, sizeof(uint32_t));
 		fnv(&pend.surf_data, sizeof(void *));
 		fnv(&pend.surf_data->emissive_src_counter, sizeof(uint32_t));
-		float xf[12];
-		for (int c = 0; c < 3; c++) {
-			xf[c * 3 + 0] = (float)pend.xform.basis.rows[c].x;
-			xf[c * 3 + 1] = (float)pend.xform.basis.rows[c].y;
-			xf[c * 3 + 2] = (float)pend.xform.basis.rows[c].z;
-		}
-		xf[9] = (float)pend.xform.origin.x;
-		xf[10] = (float)pend.xform.origin.y;
-		xf[11] = (float)pend.xform.origin.z;
-		fnv(xf, sizeof(xf));
 		const RT_MaterialData &md = material_data[pend.geometry_idx];
-		fnv(&md.glow_color[0], sizeof(float) * 11); // color..pulse_phase, contiguous
+		fnv(&md.glow_color[0], sizeof(float) * 10); // color..pulse_depth; phase excluded
 	}
 
-	if (fp == emissive_fingerprint_last) {
-		return; // Table current (up to pulse wobble). No rebuild, no upload.
+	if (fp == emissive_fingerprint_last && emissive_built.size() == emissive_pending.size()) {
+		// --- Incremental motion path: same instances, same table layout.
+		// Only transforms (and their derived pulse phases) may differ.
+		// Re-transform exactly the segments that moved; the global
+		// pdf/alias table stays STALE — safe by the pdf invariant — until
+		// accumulated power drift crosses the threshold below.
+		bool any_moved = false;
+		for (uint32_t i = 0; i < emissive_pending.size(); i++) {
+			const EmissivePendingInstance &pend = emissive_pending[i];
+			EmissiveBuiltInstance &built = emissive_built[i];
+			if (built.xform.basis.rows[0] == pend.xform.basis.rows[0] &&
+					built.xform.basis.rows[1] == pend.xform.basis.rows[1] &&
+					built.xform.basis.rows[2] == pend.xform.basis.rows[2] &&
+					built.xform.origin == pend.xform.origin) {
+				continue; // Bit-identical: same phase hash too. Nothing to do.
+			}
+			// Read the source tris through THIS frame's pending pointer —
+			// definitely alive — not the cached one. The fingerprint hashed
+			// both in order, so they match; the check below is insurance.
+			const LocalVector<RT_EmissiveSrcTri> &src = pend.surf_data->emissive_src;
+			if (built.surf_data != pend.surf_data || built.tri_count != src.size() || built.tri_start + built.tri_count > emissive_tri_data.size()) {
+				// Layout no longer matches the cached build (should be
+				// unreachable while the fingerprint holds — src_counter is
+				// hashed). Fail safe: full rebuild.
+				emissive_fingerprint_last = 0;
+				_finalize_emissive_table(p_time);
+				return;
+			}
+			any_moved = true;
+			built.xform = pend.xform;
+			const RT_MaterialData &md = material_data[pend.geometry_idx];
+			for (uint32_t s = 0; s < built.tri_count; s++) {
+				RT_EmissiveTriData &e = emissive_tri_data[built.tri_start + s];
+				const RT_EmissiveSrcTri &st = src[s];
+				Vector3 w[3];
+				for (int v = 0; v < 3; v++) {
+					w[v] = pend.xform.xform(Vector3(st.pos[v][0], st.pos[v][1], st.pos[v][2]));
+				}
+				e.pos0[0] = w[0].x;
+				e.pos0[1] = w[0].y;
+				e.pos0[2] = w[0].z;
+				e.pos1[0] = w[1].x;
+				e.pos1[1] = w[1].y;
+				e.pos1[2] = w[1].z;
+				e.pos2[0] = w[2].x;
+				e.pos2[1] = w[2].y;
+				e.pos2[2] = w[2].z;
+				e.area_ws = (float)((w[1] - w[0]).cross(w[2] - w[0]).length() * 0.5);
+				e.pulse_phase = md.glow_pulse_phase; // current origin's phase
+				// selection_pdf / alias_* stay as built — stale, consistent.
+				const float old_power = emissive_tri_power[built.tri_start + s];
+				const float new_power = _rt_emissive_tri_power(e, md, p_time);
+				emissive_tri_power[built.tri_start + s] = new_power;
+				emissive_total_power += new_power - old_power;
+				emissive_power_drift += Math::abs(new_power - old_power);
+			}
+			EmissiveDirtyRange range;
+			range.tri_start = built.tri_start;
+			range.tri_count = built.tri_count;
+			emissive_dirty_ranges.push_back(range);
+		}
+		if (!any_moved) {
+			return; // Table current (up to pulse wobble). No rebuild, no upload.
+		}
+		emissive_total_power = MAX(emissive_total_power, 0.0f);
+		// Stale pdfs cost sampling efficiency, never correctness — but
+		// don't let them drift without bound. Past 5% of total power,
+		// refresh pdf+alias over the current powers and re-upload the full
+		// table this one frame. A single moving lantern in a field never
+		// gets near this; bulk motion does, rarely and bounded.
+		if (emissive_power_drift > 0.05f * MAX(emissive_total_power, 1e-6f)) {
+			_rebuild_emissive_alias();
+			emissive_power_drift = 0.0f;
+			emissive_dirty_ranges.clear();
+			emissive_table_dirty = true; // full upload; ranges are redundant
+		}
+		return;
 	}
 	emissive_fingerprint_last = fp;
 	emissive_table_dirty = true;
+	emissive_dirty_ranges.clear();
+	emissive_power_drift = 0.0f;
 
 	emissive_tri_data.clear();
 	emissive_tri_power.clear();
 	emissive_map_segments.clear();
 	emissive_map_slots.clear();
 	emissive_map_data.clear();
+	emissive_built.clear();
 	emissive_total_power = 0.0f;
 
 	for (uint32_t i = 0; i < emissive_pending.size(); i++) {
 		const EmissivePendingInstance &pend = emissive_pending[i];
+		const uint32_t tri_start = emissive_tri_data.size();
 		_append_emissive_instance(pend.surf_data, material_data[pend.geometry_idx], pend.geometry_idx, pend.xform);
+		// Record the segment for the incremental motion path. tri_count ==
+		// emissive_src.size() by construction (_append pushes one entry per
+		// cached source triangle), which the incremental path re-asserts.
+		EmissiveBuiltInstance built;
+		built.surf_data = pend.surf_data;
+		built.geometry_idx = pend.geometry_idx;
+		built.tri_start = tri_start;
+		built.tri_count = emissive_tri_data.size() - tri_start;
+		built.xform = pend.xform;
+		emissive_built.push_back(built);
 	}
 
 	const uint32_t n = emissive_tri_data.size();
 
-	// --- Per-triangle power: degree-2 edge-midpoint quadrature of the
-	// canonical glow formula. The integrand is NOT barycentric-linear
-	// (rim = pow(1-edge, rim_power); the corrected handoff explains why this
-	// still cannot create a zero-power-but-emitting triangle).
+	// --- Per-triangle power (quadrature shared with the motion path).
 	for (uint32_t i = 0; i < n; i++) {
-		RT_EmissiveTriData &e = emissive_tri_data[i];
-		const RT_MaterialData &md = material_data[e.geometry_idx];
-
-		// Unpack the SAME quantized values the shader will unpack.
-		float edge[3], mem[3], mask[3];
-		for (int v = 0; v < 3; v++) {
-			uint32_t c = e.color_packed[v];
-			edge[v] = (float)((c >> 16) & 0xFFu) / 255.0f; // COLOR.b
-			mask[v] = (float)((c >> 24) & 0xFFu) / 255.0f; // COLOR.a
-			mem[v] = Math::half_to_float((uint16_t)(e.uv_packed[v] >> 16)); // UV.y
-		}
-		auto glow_at = [&](float p_edge, float p_mem, float p_mask) -> float {
-			float rim = Math::pow(CLAMP(1.0f - p_edge, 0.0f, 1.0f), md.glow_rim_power);
-			return (md.glow_core_floor + rim * md.glow_rim_boost + p_mem * md.glow_membrane_boost) * p_mask;
-		};
-		// Edge midpoints (degree-2 exact for polynomials up to quadratic).
-		float mean_glow = (glow_at(0.5f * (edge[0] + edge[1]), 0.5f * (mem[0] + mem[1]), 0.5f * (mask[0] + mask[1])) +
-								  glow_at(0.5f * (edge[1] + edge[2]), 0.5f * (mem[1] + mem[2]), 0.5f * (mask[1] + mask[2])) +
-								  glow_at(0.5f * (edge[2] + edge[0]), 0.5f * (mem[2] + mem[0]), 0.5f * (mask[2] + mask[0]))) /
-				3.0f;
-
-		float pulse = 1.0f + md.glow_pulse_depth * Math::sin(p_time * (float)Math::TAU * md.glow_pulse_rate_hz + e.pulse_phase * (float)Math::TAU);
-		float lum = 0.2126f * md.glow_color[0] + 0.7152f * md.glow_color[1] + 0.0722f * md.glow_color[2];
-		float power = e.area_ws * mean_glow * md.glow_energy * lum * pulse;
-		emissive_tri_power[i] = MAX(power, 0.0f);
+		emissive_tri_power[i] = _rt_emissive_tri_power(emissive_tri_data[i], material_data[emissive_tri_data[i].geometry_idx], p_time);
 		emissive_total_power += emissive_tri_power[i];
 	}
 
-	// --- Selection pdfs + Vose alias table.
+	_rebuild_emissive_alias();
+
+	// --- Reverse map layout (documented for the Step-3 shader lookup):
+	//   [0 .. 2*geometry_count)   header: per geometry_idx a pair
+	//                             { absolute segment offset, segment prim count }
+	//                             offset == RT_EMISSIVE_NONE -> no emitters.
+	//   [2*geometry_count .. end) segments: prim_id -> entry index or NONE.
+	// Lookup: off = map[g*2]; cnt = map[g*2+1];
+	//         entry = (off != NONE && prim_id < cnt) ? map[off + prim_id] : NONE.
+	// The count guards prim_ids beyond a surface's last emissive triangle —
+	// without it those hits would read out of the segment's bounds.
+	const uint32_t geo_count = geometry_data.size();
+	const uint32_t header_size = geo_count * 2u;
+	emissive_map_data.clear();
+	emissive_map_data.resize(header_size + emissive_map_slots.size());
+	for (uint32_t g = 0; g < header_size; g++) {
+		emissive_map_data[g] = RT_EMISSIVE_NONE;
+	}
+	for (uint32_t s = 0; s < emissive_map_segments.size(); s++) {
+		const EmissiveMapSegment &seg = emissive_map_segments[s];
+		emissive_map_data[seg.geometry_idx * 2u + 0u] = header_size + seg.seg_start;
+		emissive_map_data[seg.geometry_idx * 2u + 1u] = seg.prim_count;
+	}
+	for (uint32_t i = 0; i < emissive_map_slots.size(); i++) {
+		emissive_map_data[header_size + i] = emissive_map_slots[i];
+	}
+}
+
+/// Selection pdfs + Vose alias table over the CURRENT emissive_tri_power.
+/// Split out of _finalize_emissive_table so the incremental motion path can
+/// refresh sampling after enough power drift without re-assembling geometry.
+void RenderRaytracing::_rebuild_emissive_alias() {
+	const uint32_t n = emissive_tri_data.size();
 	if (n > 0 && emissive_total_power > 0.0f) {
 		LocalVector<float> scaled; // power/total * n
 		LocalVector<uint32_t> small_stack, large_stack;
@@ -3370,31 +3510,6 @@ void RenderRaytracing::_finalize_emissive_table(float p_time) {
 			emissive_tri_data[s].alias_prob = 1.0f;
 			emissive_tri_data[s].alias_idx = s;
 		}
-	}
-
-	// --- Reverse map layout (documented for the Step-3 shader lookup):
-	//   [0 .. 2*geometry_count)   header: per geometry_idx a pair
-	//                             { absolute segment offset, segment prim count }
-	//                             offset == RT_EMISSIVE_NONE -> no emitters.
-	//   [2*geometry_count .. end) segments: prim_id -> entry index or NONE.
-	// Lookup: off = map[g*2]; cnt = map[g*2+1];
-	//         entry = (off != NONE && prim_id < cnt) ? map[off + prim_id] : NONE.
-	// The count guards prim_ids beyond a surface's last emissive triangle —
-	// without it those hits would read out of the segment's bounds.
-	const uint32_t geo_count = geometry_data.size();
-	const uint32_t header_size = geo_count * 2u;
-	emissive_map_data.clear();
-	emissive_map_data.resize(header_size + emissive_map_slots.size());
-	for (uint32_t g = 0; g < header_size; g++) {
-		emissive_map_data[g] = RT_EMISSIVE_NONE;
-	}
-	for (uint32_t s = 0; s < emissive_map_segments.size(); s++) {
-		const EmissiveMapSegment &seg = emissive_map_segments[s];
-		emissive_map_data[seg.geometry_idx * 2u + 0u] = header_size + seg.seg_start;
-		emissive_map_data[seg.geometry_idx * 2u + 1u] = seg.prim_count;
-	}
-	for (uint32_t i = 0; i < emissive_map_slots.size(); i++) {
-		emissive_map_data[header_size + i] = emissive_map_slots[i];
 	}
 }
 
