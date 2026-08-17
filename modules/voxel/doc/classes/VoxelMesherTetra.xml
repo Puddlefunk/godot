@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="VoxelMesherTetra" inherits="VoxelMesher" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../schema.xsd">
+	<brief_description>
+		Marching-tetrahedra mesher with a deterministic faceted stylization pass.
+	</brief_description>
+	<description>
+		Produces a flat-shaded surface from SDF voxels by splitting each cell of the sample lattice into six tetrahedra, then displacing welded surface vertices with a hash-based lattice warp and per-patch relief. The displacement fields are evaluated in global voxel space from integer cell hashes, so results are deterministic and seam-consistent across mesh blocks.
+		LOD is not supported: use this mesher with [VoxelTerrain], not [VoxelLodTerrain].
+	</description>
+	<tutorials>
+	</tutorials>
+	<members>
+		<member name="subdivisions" type="int" setter="set_subdivisions" getter="get_subdivisions" default="2">
+			Marching cells per voxel along each axis. Density between voxel samples is interpolated trilinearly. Higher values quadruple-to-64x the work; 2 matches the source project's shipping resolution.
+		</member>
+		<member name="warp_enabled" type="bool" setter="set_warp_enabled" getter="get_warp_enabled" default="true">
+			Master switch for the stylization pass. When disabled, the raw marching-tetrahedra surface is emitted.
+		</member>
+		<member name="lattice_warp" type="float" setter="set_lattice_warp" getter="get_lattice_warp" default="0.24">
+			Amplitude, in voxels, of the smoothed hash vector field displacing every surface vertex (the "irregular grid" component of the look).
+		</member>
+		<member name="patch_relief" type="float" setter="set_patch_relief" getter="get_patch_relief" default="0.11">
+			Amplitude, in voxels, of the along-normal relief applied per hashed patch (the "faceted patchwork" component of the look).
+		</member>
+		<member name="patch_size" type="float" setter="set_patch_size" getter="get_patch_size" default="1.25">
+			Edge length, in voxels, of the cubic cells the relief field is hashed on.
+		</member>
+		<member name="patch_relief_smoothing" type="float" setter="set_patch_relief_smoothing" getter="get_patch_relief_smoothing" default="0.0">
+			0 gives hard per-patch steps; 1 gives fully trilinearly smoothed relief. Smoothed relief reads flatter at equal amplitude.
+		</member>
+		<member name="default_color" type="Color" setter="set_default_color" getter="get_default_color" default="Color(1, 1, 1, 1)">
+			Uniform vertex color written to every vertex, available as COLOR in shaders.
+		</member>
+		<member name="uv_scale" type="float" setter="set_uv_scale" getter="get_uv_scale" default="0.35">
+			Scale applied to the triplanar UVs derived from the un-warped surface positions.
+		</member>
+	</members>
+</class>
