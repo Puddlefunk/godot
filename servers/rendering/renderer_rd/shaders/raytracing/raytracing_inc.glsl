@@ -190,8 +190,17 @@ float mis_pdf_load(uint packed) {
 	return mis_pdf_decode(code);
 }
 
-// Bounce limits
-#define MAX_DIFFUSE_BOUNCES 2u
+// Bounce limits. MAX_DIFFUSE_BOUNCES (a hard cap of 2, biased truncation) is
+// retired as of Step 4 (HANDOFF_DIFFUSE_EMISSIVES): from this diffuse depth
+// on, Russian roulette decides continuation instead — unbiased, throughput-
+// weighted, bounded above by RT_GET_MAX_BOUNCES(). See shade_and_bounce.
+#define RT_RR_START_DIFFUSE_BOUNCES 2u
+// Survival probability clamp: the floor stops near-black paths from living
+// forever at huge 1/p weights (firefly control); the ceiling guarantees
+// every roll keeps at least a 5% termination chance so expected path length
+// stays bounded even at full throughput.
+#define RT_RR_P_MIN 0.05
+#define RT_RR_P_MAX 0.95
 #define MAX_DENOISER_SPECULAR_HIT_THRESHOLD 0.25
 
 // ============================================================================
@@ -215,10 +224,44 @@ uint pcg_hash(uint seed) {
 }
 
 /// Initialize RNG state with improved mixing to eliminate patterns
+// ============================================================================
+// Low-discrepancy first-vertex sampling (HANDOFF Step 4, increment B).
+// RTXPT-where-free scope: the R2 additive recurrence (Roberts' plastic-
+// constant sequence) with a per-pixel, per-dimension-pair Cranley-Patterson
+// rotation, applied ONLY to the camera-vertex sampling decisions (first
+// diffuse hemisphere pair, first NEE draws). Deeper bounces keep white-noise
+// PCG — full path-space Sobol would need per-dimension sample indexing the
+// payload cannot carry (0 free bits, PAYLOAD_BUDGET par.3).
+//
+// The rotation hashes ONLY (pixel, dim) — stable across frames — so each
+// pixel walks the same well-spaced sequence over time and the temporal
+// accumulator integrates stratified samples; the per-pixel offset is what
+// keeps neighbours decorrelated (no shared-lattice aliasing — the seed bug
+// fixed above is not reintroduced by construction).
+// ============================================================================
+#define LD_N_INVALID 0xFFFFFFFFu
+
+vec2 ld_r2(uint n) {
+	// 1/phi2 and 1/phi2^2 for the plastic constant phi2 ~= 1.32471795.
+	return fract(vec2(n) * vec2(0.7548776662466927, 0.5698402909980532));
+}
+
+vec2 ld_first_vertex(uvec2 pixel, uint n, uint dim_pair) {
+	uint h = pcg_hash(pixel.x ^ pcg_hash(pixel.y ^ pcg_hash(0x9E3779B9u + dim_pair)));
+	vec2 rot = vec2(float(h & 0xFFFFu), float((h >> 16) & 0xFFFFu)) * (1.0 / 65536.0);
+	return fract(ld_r2(n) + rot);
+}
+
 uint init_rng(uvec2 pixel, uint frame, uint sample_idx) {
-	// Use Wang hash for better mixing - eliminates linear patterns
-	uint seed = pixel.x + pixel.y * 65536u + frame * 1000000u + sample_idx * 100000000u;
-	return pcg_hash(seed);
+	// Nested-hash the dimensions (Step 4, 12 Aug 2026). The old additive
+	// seed (x + y*65536 + frame*1e6 + sample*1e8) aliased: 1e6 = 15*65536 +
+	// 16960, so frame+1 produced EXACTLY the seed of pixel (+16960, +15) in
+	// the previous frame — the per-pixel stream lattice translated
+	// diagonally each frame, and a static camera's temporal accumulation
+	// averaged lag-correlated streams into a stable structured mottle
+	// (first seen on the forensic Cornell green wall). Nesting pcg_hash
+	// between dimensions makes cross-dimension collisions non-systematic.
+	return pcg_hash(pixel.x ^ pcg_hash(pixel.y ^ pcg_hash(frame ^ pcg_hash(sample_idx))));
 }
 
 /// Random float in [0, 1)

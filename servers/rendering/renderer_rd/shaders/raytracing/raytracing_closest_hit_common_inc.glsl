@@ -101,6 +101,63 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 	return sample_bindless_texture(tex_idx, uv);
 }
 
+/// Select one scalar from a sampled texel by BaseMaterial3D TextureChannel index
+/// (0=R 1=G 2=B 3=A 4=grayscale). Raster does this with a vec4 dot-mask
+/// (roughness_texture_channel etc.); the host packs the mask down to this index
+/// in MaterialData.texture_channels.
+float rt_channel_sample(vec4 s, uint ch) {
+	if (ch == 0u) {
+		return s.r;
+	}
+	if (ch == 1u) {
+		return s.g;
+	}
+	if (ch == 2u) {
+		return s.b;
+	}
+	if (ch == 3u) {
+		return s.a;
+	}
+	return dot(s.rgb, vec3(1.0 / 3.0));
+}
+
+// ============================================================================
+// TEXTURE LOD (first-order ray cone)
+// ============================================================================
+// Ray/hit stages have no implicit derivatives: `texture()` compiles to an
+// explicit LOD-0 sample in SPIR-V, so every material texture used to be read
+// at full resolution regardless of hit distance. Raster mip-filters
+// high-frequency normal maps toward flat exactly where triplanar projections
+// stretch (the near-tangent axes); at LOD 0 the PT hit path read raw
+// full-contrast texels there, and the violently perturbed normals became the
+// bright "shiny splits/stretches" streaks on normal-mapped rock — PT-only,
+// scaling with normal_scale, invisible to any math-level audit because the
+// formulas DID mirror raster. Sampling at the ray-cone footprint restores
+// raster's filtering, which is what lets a heavy normal_scale look heavy
+// without fireflies.
+//
+// First-order cone: footprint = hit distance * angular size of one pixel.
+// Segment-local (gl_HitTEXT, not accumulated path length): the payload has no
+// spare bits for cone state (PAYLOAD_BUDGET.md), and primary hits are where
+// the artifact lives; secondary bounces only under-filter, and they are
+// denoised anyway.
+float rt_cone_width_at_hit() {
+	// projection_matrix[1][1] == 1/tan(fov_y/2) for a perspective projection;
+	// one pixel subtends ~2*tan(fov_y/2)/viewport_h radians at the image
+	// center. (Orthographic dev cameras get a slight over-blur — acceptable.)
+	float pixel_spread = 2.0 / (scene_data_block.data.projection_matrix[1][1] * scene_data_block.data.viewport_size.y);
+	return gl_HitTEXT * pixel_spread;
+}
+
+/// sample_material_texture with an explicit LOD. Point-filtered (pixel art)
+/// materials keep nearest filtering within the selected mip.
+vec4 sample_material_texture_lod(uint tex_idx, vec2 uv, uint mat_flags, float lod) {
+	if ((mat_flags & 4u) != 0u) {
+		return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), uv, lod);
+	}
+	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, lod);
+}
+
 /// Apply tangent-space normal map to geometry normal.
 vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_depth) {
 	vec3 mapped = h.tangent * tangent_space_normal.x + h.bitangent * tangent_space_normal.y + h.geometry_normal * tangent_space_normal.z;
@@ -124,6 +181,12 @@ struct TriplanarCoords {
 	vec3 pos;
 	vec3 tangent; // World-space axis-aligned frame for normal mapping,
 	vec3 binormal; // matching raster's generated TANGENT/BINORMAL.
+	// Per-axis UV-space footprint of the ray cone at this hit. Each projection
+	// axis stretches by 1/|n_axis| (surface near-parallel to the projection ->
+	// long smeared texel runs -> the streak zones), so each axis carries its
+	// own footprint. Multiplied by the texture's size at sample time to get a
+	// per-axis LOD (see sample_material_texture_triplanar).
+	vec3 uv_width;
 };
 
 TriplanarCoords compute_triplanar_coords(HitData h, MaterialData mat, GeometryData geom) {
@@ -160,14 +223,33 @@ TriplanarCoords compute_triplanar_coords(HitData h, MaterialData mat, GeometryDa
 	}
 	tc.tangent = normalize(t);
 	tc.binormal = normalize(b);
+
+	// Ray-cone footprint per projection axis, in UV units. Axis i samples a
+	// plane the cone crosses at |n_i| incidence: footprint stretches by
+	// 1/|n_i|, unbounded as the surface goes tangent to the projection —
+	// exactly where raster's derivative-driven mips averaged the normal map
+	// flat and LOD-0 PT did not. The 1e-3 floor only bounds the arithmetic;
+	// hardware clamps to the last mip anyway. UV scale per axis pairs the two
+	// scale components that projection actually uses (max = conservative, like
+	// trilinear picking the larger derivative).
+	float cone_width = rt_cone_width_at_hit();
+	vec3 axis_scale = vec3(
+			max(abs(mat.uv1_scale_z), abs(mat.uv1_scale.y)), // x axis samples pos.zy
+			max(abs(mat.uv1_scale.x), abs(mat.uv1_scale_z)), // y axis samples pos.xz
+			max(abs(mat.uv1_scale.x), abs(mat.uv1_scale.y))); // z axis samples pos.xy
+	tc.uv_width = cone_width * axis_scale / max(abs(n), vec3(1e-3));
 	return tc;
 }
 
 vec4 sample_material_texture_triplanar(uint tex_idx, TriplanarCoords tc, uint mat_flags) {
+	// Per-axis LOD from the cone footprint and this texture's resolution.
+	// textureSize is per-texture, so this cannot live in TriplanarCoords.
+	float tex_size = float(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0).y);
+	vec3 lods = log2(max(tc.uv_width * tex_size, vec3(1.0)));
 	vec4 samp = vec4(0.0);
-	samp += sample_material_texture(tex_idx, tc.pos.xy, mat_flags) * tc.weights.z;
-	samp += sample_material_texture(tex_idx, tc.pos.xz, mat_flags) * tc.weights.y;
-	samp += sample_material_texture(tex_idx, tc.pos.zy * vec2(-1.0, 1.0), mat_flags) * tc.weights.x;
+	samp += sample_material_texture_lod(tex_idx, tc.pos.xy, mat_flags, lods.z) * tc.weights.z;
+	samp += sample_material_texture_lod(tex_idx, tc.pos.xz, mat_flags, lods.y) * tc.weights.y;
+	samp += sample_material_texture_lod(tex_idx, tc.pos.zy * vec2(-1.0, 1.0), mat_flags, lods.x) * tc.weights.x;
 	return samp;
 }
 
@@ -572,11 +654,32 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	}
 	ps.radiance += ps.throughput * m.emissive * emissive_mis_weight;
 
-	// Bounce limit check.
-	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
+	// Bounce limits (Step 4). The total-bounce cap stays as the hard ceiling
+	// (the payload counters' carry-free arithmetic depends on it,
+	// PAYLOAD_BUDGET.md §3). The old MAX_DIFFUSE_BOUNCES 2 truncation is
+	// retired: from that diffuse depth on, RUSSIAN ROULETTE decides
+	// continuation. Survival probability tracks remaining throughput; the
+	// survivor's throughput is divided by it, so the estimator is unbiased
+	// where the cap silently deleted energy — multi-bounce diffuse
+	// interiors, and every backlit-membrane path (a diffuse-transmission
+	// bounce counts as diffuse). A terminated path keeps this vertex's
+	// emission — added above, before the roll — and drops NEE +
+	// continuation, the exact shape the old cap had, reweighted instead of
+	// truncated: NEE at this vertex is only evaluated by survivors, whose
+	// 1/p makes its expectation come out right.
+	if (total_bounces >= RT_GET_MAX_BOUNCES()) {
 		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 		path_pack(payload, ps);
 		return;
+	}
+	if (diffuse_bounces >= RT_RR_START_DIFFUSE_BOUNCES) {
+		float rr_p = clamp(max(ps.throughput.r, max(ps.throughput.g, ps.throughput.b)), RT_RR_P_MIN, RT_RR_P_MAX);
+		if (rand(ps.rng_state) >= rr_p) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+		ps.throughput /= rr_p;
 	}
 
 	// BRDF material setup.
@@ -700,6 +803,25 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		specular_select_p = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
 	}
 
+	// Low-discrepancy sequence index for CAMERA-vertex draws (Step 4 inc. B).
+	// Advances per frame; at spp 2 the second sample gets its own point via
+	// the sample-zero flag (the only per-sample bit the payload carries).
+	// spp > 2: samples past the first fall back to white noise rather than
+	// duplicating a sequence point (duplication would CORRELATE samples —
+	// worse than white). Bounce vertices are always white (see the helper's
+	// header note).
+	uint ld_n = LD_N_INVALID;
+	if (total_bounces == 0u) {
+		uint ld_spp = RT_GET_SAMPLE_COUNT();
+		if (ld_spp == 1u) {
+			ld_n = uint(get_rt_param(RT_PARAM_FRAME_INDEX));
+		} else if (ld_spp == 2u) {
+			ld_n = uint(get_rt_param(RT_PARAM_FRAME_INDEX)) * 2u + (is_sample_zero(ps.packed_bounces_flags) ? 0u : 1u);
+		} else if (is_sample_zero(ps.packed_bounces_flags)) {
+			ld_n = uint(get_rt_param(RT_PARAM_FRAME_INDEX));
+		}
+	}
+
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_TRI_COUNT));
 	// Delta transmission has zero BRDF value in any NEE-sampled light
@@ -715,7 +837,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
 				h.hit_pos, h.geometry_normal, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count,
-				rt_emissive_count, get_rt_param(RT_PARAM_EMISSIVE_POOL_PROB), specular_select_p);
+				rt_emissive_count, get_rt_param(RT_PARAM_EMISSIVE_POOL_PROB), specular_select_p, ld_n);
 		ps.radiance += ps.throughput * direct_light;
 	}
 
@@ -756,7 +878,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 	}
 
-	vec2 u = rand2(ps.rng_state);
+	// Camera-vertex BSDF pair comes from the R2 sequence (dim pair 0);
+	// bounce vertices and spp>2 extras stay white. The white draw is NOT
+	// consumed when LD substitutes — stream position is not semantic.
+	vec2 u = (ld_n != LD_N_INVALID)
+			? ld_first_vertex(uvec2(gl_LaunchIDEXT.xy), ld_n, 0u)
+			: rand2(ps.rng_state);
 	vec3 next_dir;
 	vec3 brdf_weight;
 	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {

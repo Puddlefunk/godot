@@ -386,7 +386,8 @@ vec3 lights_sample_emissive_triangle(
 		inout uint rng_state,
 		float specular_select_p,
 		uint tri_count,
-		float pool_prob) {
+		float pool_prob,
+		uint ld_n) {
 	// O(1) alias-table selection.
 	uint i = min(uint(rand(rng_state) * float(tri_count)), tri_count - 1u);
 	RTEmissiveTriData e = emissive_tris[i];
@@ -397,11 +398,16 @@ vec3 lights_sample_emissive_triangle(
 		return vec3(0.0);
 	}
 
-	// Uniform point on the triangle (sqrt warp).
+	// Uniform point on the triangle (sqrt warp). Camera-vertex draws use the
+	// R2 sequence (dim pair 1 — Step 4 inc. B); alias-table selection above
+	// stays white (stratifying a discrete jump table scrambles rather than
+	// stratifies).
 	vec3 p0 = vec3(e.pos0_x, e.pos0_y, e.pos0_z);
 	vec3 p1 = vec3(e.pos1_x, e.pos1_y, e.pos1_z);
 	vec3 p2 = vec3(e.pos2_x, e.pos2_y, e.pos2_z);
-	vec2 u = rand2(rng_state);
+	vec2 u = (ld_n != LD_N_INVALID)
+			? ld_first_vertex(uvec2(gl_LaunchIDEXT.xy), ld_n, 1u)
+			: rand2(rng_state);
 	float su = sqrt(u.x);
 	vec3 bary = vec3(1.0 - su, su * (1.0 - u.y), su * u.y);
 	vec3 P = p0 * bary.x + p1 * bary.y + p2 * bary.z;
@@ -491,7 +497,8 @@ vec3 lights_evaluate_direct_lighting(
 		uint light_count,
 		uint emissive_tri_count,
 		float emissive_pool_prob,
-		float specular_select_p) {
+		float specular_select_p,
+		uint ld_n) {
 	bool has_analytic = light_count > 0u;
 	bool has_emissive = emissive_tri_count > 0u;
 	if (!has_analytic && !has_emissive) {
@@ -510,7 +517,7 @@ vec3 lights_evaluate_direct_lighting(
 		// NOTE: p_light inside the helper already includes pool_e — it is
 		// the FULL pdf, so no further division here (and the hit-side
 		// reverse lookup reports the same full pdf; the twins must agree).
-		return lights_sample_emissive_triangle(hit_pos, geo_n, N, V, material, rng_state, specular_select_p, emissive_tri_count, pool_e);
+		return lights_sample_emissive_triangle(hit_pos, geo_n, N, V, material, rng_state, specular_select_p, emissive_tri_count, pool_e, ld_n);
 	}
 	float analytic_inv_prob = 1.0 / (1.0 - pool_e);
 
@@ -549,7 +556,12 @@ vec3 lights_evaluate_direct_lighting(
 	float light_select_pdf = 1.0 / max(valid_count_estimate, 1.0);
 
 	RTLightData light = rt_lights[selected_idx];
-	vec2 u = rand2(rng_state);
+	// Camera-vertex analytic-light sample (cone/sphere) from the R2 sequence
+	// (dim pair 2); reservoir selection above stays white — same discrete-
+	// draw reasoning as the alias table.
+	vec2 u = (ld_n != LD_N_INVALID)
+			? ld_first_vertex(uvec2(gl_LaunchIDEXT.xy), ld_n, 2u)
+			: rand2(rng_state);
 
 	// === POSITIONAL LIGHT PATH (omni + spot) ===
 	if (light.type == RT_LIGHT_TYPE_OMNI || light.type == RT_LIGHT_TYPE_SPOT) {
