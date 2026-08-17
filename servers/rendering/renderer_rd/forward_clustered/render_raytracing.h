@@ -505,6 +505,17 @@ class RenderRaytracing {
 	uint32_t cache_hits = 0;
 	uint32_t cache_misses = 0;
 
+	// Per-frame BLAS build triangle budget (device-lost mitigation,
+	// 2026-08-17): from-scratch builds charge _blas_build_budget_allows();
+	// over budget they defer to a later frame. Reset in prepare_frame().
+	// merged_mm_deferred lets _build_merged_mm_blas report "over budget"
+	// distinctly from "unsupported" (which falls back to the expanded path).
+	uint32_t frame_blas_build_tris = 0;
+	uint32_t frame_blas_deferred_surfaces = 0;
+	uint64_t frame_blas_deferred_tris = 0;
+	bool merged_mm_deferred = false;
+	bool _blas_build_budget_allows(uint32_t p_tris);
+
 	// Per-frame scratch arrays.
 	LocalVector<RT_GeometryData> geometry_data;
 	LocalVector<RT_MaterialData> material_data;

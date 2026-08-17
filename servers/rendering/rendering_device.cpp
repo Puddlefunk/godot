@@ -142,13 +142,21 @@ static RD::HitShaderBindingTableRange _encode_hit_sbt_range(uint32_t p_offset, u
 // This behavior can be disabled if it's suspected that the graph is not detecting dependencies correctly and more control over the order of
 // the commands is desired (e.g. debugging).
 
-#define RENDER_GRAPH_REORDER 1
+// 2026-08-18: reorder=0 was used to corner the PT device-lost (crash under
+// reorder, stable serial → a reorderable pair lacked a dependency edge).
+// Root cause: untracked AABB buffers — buffer_update vs blas_build with no
+// edge; fixed by promoting AABB buffers to tracked in blas_create.
+#define RENDER_GRAPH_REORDER 0
 
 // Synchronization barriers are issued between the graph's levels only with the necessary amount of detail to achieve the correct result. If
 // it's suspected that the graph is not doing this correctly, full barriers can be issued instead that will block all types of operations
 // between the synchronization levels. This setting will have a very negative impact on performance when enabled, so it's only intended for
 // debugging purposes.
 
+// 2026-08-18: temporarily forced to 1 to diagnose the PT-toggle device-lost;
+// the crash vanished under full barriers, confirming the missing cross-frame
+// WAW memory dependency (fixed surgically in RenderingDeviceGraph::
+// _add_command_to_graph — see the previous_frame_stages block there).
 #define RENDER_GRAPH_FULL_BARRIERS 0
 
 // The command graph can automatically issue secondary command buffers and record them on background threads when they reach an arbitrary
@@ -396,11 +404,23 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 				a_out.stride = a_in.stride;
 				a_out.count = a_in.count;
 
-				if (aabb_buffer->draw_tracker != nullptr) {
-					draw_trackers.push_back(aabb_buffer->draw_tracker);
-				} else {
-					untracked_buffers.insert(a_in.buffer);
+				// AABB buffers are dynamic by nature (procedural geometry
+				// updates them via buffer_update, which — unlike buffer_copy —
+				// does NOT promote its target to a tracked resource). An
+				// untracked AABB buffer means the per-frame transfer write and
+				// the BLAS build that reads it share no dependency edge, so
+				// the render graph's reorder can overlap them on the GPU —
+				// the AS builder then consumes torn AABB data and the NVIDIA
+				// driver dies with VK_ERROR_DEVICE_LOST (2026-08-18, root
+				// cause of the PT device-lost crash family). Promote to
+				// mutable here so every future update/build pair gets an edge
+				// and a barrier. Triangle vertex/index buffers stay untracked
+				// on purpose — they are immutable uploads, and tracking them
+				// would add barrier overhead to every static mesh.
+				if (_buffer_make_mutable(aabb_buffer, a_in.buffer)) {
+					draw_graph.add_synchronization();
 				}
+				draw_trackers.push_back(aabb_buffer->draw_tracker);
 
 				_check_transfer_worker_buffer(aabb_buffer);
 			} break;
@@ -550,6 +570,34 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	ERR_FAIL_NULL_V_MSG(tlas, ERR_INVALID_PARAMETER, "TLAS argument is not valid.");
 	ERR_FAIL_COND_V_MSG(p_instances.size() > tlas->max_instance_count, ERR_INVALID_PARAMETER, "Exceeded the maximum amount of instances allowed in the TLAS.");
 
+	// Validate EVERY instance before mutating any tracking state (2026-08-17
+	// device-lost audit). This function used to clear the TLAS->BLAS
+	// dependency edges first and could then ERR_FAIL out of the write loop on
+	// a bad instance (e.g. a BLAS whose build failed on a scratch allocation,
+	// leaving it invalidated). The abort left the TLAS with
+	// invalidated == false from its last successful build but NO dependency
+	// edges — so later frees of the BLASes the GPU-side TLAS still references
+	// never invalidated it, the bind-time check kept passing, and traces ran
+	// against destroyed BLAS memory once the frame-dispose window passed
+	// (VK_ERROR_DEVICE_LOST, breadcrumbed on unrelated passes). Only a fully
+	// valid instance list may proceed past this loop.
+	thread_local LocalVector<AccelerationStructure *> instance_blases;
+	instance_blases.clear();
+	instance_blases.reserve(p_instances.size());
+	for (uint32_t i = 0; i < p_instances.size(); i++) {
+		const AccelerationStructureInstance &rd_instance = p_instances[i];
+		AccelerationStructure *blas = nullptr;
+		if (rd_instance.blas.is_valid()) {
+			ERR_FAIL_COND_V_MSG(!rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
+
+			blas = acceleration_structure_owner.get_or_null(rd_instance.blas);
+			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+		}
+		instance_blases.push_back(blas);
+	}
+
 	Error err = _acceleration_structure_scratch_buffer_create(tlas);
 	ERR_FAIL_COND_V(err != OK, err);
 
@@ -602,6 +650,14 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 	_tlas_remove_blas_dependencies(tlas, p_tlas);
 
+	// Belt-and-braces for the validate-first contract above: from the moment
+	// the dependency edges are cleared until the build is recorded, the TLAS
+	// must not be considered traceable. The write loop below has no error
+	// exits today; if one is ever added, an abort now fails safe (bind-time
+	// invalidated check refuses the stale TLAS) instead of leaving a
+	// trackerless, trace-passing TLAS behind.
+	tlas->invalidated = true;
+
 	thread_local LocalVector<RDG::ResourceTracker *> draw_trackers;
 	draw_trackers.clear();
 
@@ -621,13 +677,10 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 		rdd_instance.hit_sbt_offset = _decode_hit_sbt_range_offset(rd_instance.hit_sbt_range);
 		rdd_instance.flags = rd_instance.flags;
 
-		if (rd_instance.blas.is_valid()) {
-			ERR_FAIL_COND_V_MSG(!rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
-
-			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(rd_instance.blas);
-			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
-			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
-			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+		// Validated in the pre-pass above; pool pointers are stable within
+		// this render-thread call (no AS pool mutation between the two loops).
+		AccelerationStructure *blas = instance_blases[i];
+		if (blas != nullptr) {
 			rdd_instance.blas = blas->driver_id;
 
 			if (!tlas->acceleration_structure_dependencies.has(rd_instance.blas)) {

@@ -611,6 +611,10 @@ void RenderRaytracing::prepare_frame() {
 	// Reset per-frame metrics
 	cache_hits = 0;
 	cache_misses = 0;
+	frame_blas_build_tris = 0;
+	frame_blas_deferred_surfaces = 0;
+	frame_blas_deferred_tris = 0;
+	merged_mm_deferred = false;
 
 	if (!bindless_block->is_initialized()) {
 		bindless_block->initialize(RD::get_singleton());
@@ -621,6 +625,41 @@ void RenderRaytracing::prepare_frame() {
 // ---------------------------------------------------------------------------
 // Surface processing
 // ---------------------------------------------------------------------------
+
+_FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_primitive, uint32_t p_indices) {
+	static const uint32_t divisor[RSE::PRIMITIVE_MAX] = { 1, 2, 1, 3, 1 };
+	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
+	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
+}
+
+// Device-lost mitigation (2026-08-17). Seven VK_ERROR_DEVICE_LOST crashes,
+// every one within frames of a fresh world entering the tree: the whole
+// world's from-scratch BLAS builds + buffer uploads used to submit in ONE
+// frame's command stream, and nvoglv64 dies somewhere in that burst (fence
+// wait, VkResult -4, breadcrumbs BLIT/UI/SKY). Game-side spawn staggering
+// (crash #8) was not enough, so the cap lives where the submissions are
+// actually generated. STATIC-surface and merged-MultiMesh from-scratch
+// builds charge their triangle count here; once a frame is over budget,
+// further builds are DEFERRED — the caller skips the instance for this
+// frame and retries the next, so the worst case is a few frames of pop-in
+// during world spawn. Rules: budget 0 disables; the frame's FIRST build is
+// always granted (a single mesh larger than the whole budget must still
+// build or it would never appear); refits are never charged (they are
+// cheap and deferring them desyncs animation); deformed full rebuilds are
+// NOT charged either — deferring one blanks/desyncs a skinned mesh the
+// same way a deferred refit would. (Audit 2026-08-17: this comment used to
+// claim EVERY from-scratch build charges; only the two paths above do.)
+bool RenderRaytracing::_blas_build_budget_allows(uint32_t p_tris) {
+	static const uint32_t BLAS_BUILD_TRI_BUDGET = (uint32_t)GLOBAL_GET("rendering/pathtracing/max_blas_build_triangles_per_frame");
+	if (BLAS_BUILD_TRI_BUDGET == 0u || frame_blas_build_tris == 0u ||
+			frame_blas_build_tris + p_tris <= BLAS_BUILD_TRI_BUDGET) {
+		frame_blas_build_tris += p_tris;
+		return true;
+	}
+	frame_blas_deferred_surfaces += 1u;
+	frame_blas_deferred_tris += p_tris;
+	return false;
+}
 
 RTSurfaceData *RenderRaytracing::process_surface(
 		const void *p_surf,
@@ -669,6 +708,14 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	}
 
 	cache_misses++;
+
+	// A miss below this line means a from-scratch BLAS build in THIS frame's
+	// command stream — charge the budget first. Deferred: return null before
+	// anything is freed or cached, so the caller skips the instance and the
+	// next frame retries cleanly. (Cache hits above are never charged.)
+	if (!_blas_build_budget_allows(_rt_indices_to_primitives(surf->primitive, mesh_storage->mesh_surface_get_vertices_drawn_count(p_mesh_surface)))) {
+		return nullptr;
+	}
 
 	// Allocate or reuse entry
 	if (!entry->ptr) {
@@ -2201,6 +2248,20 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	bool structure_changed = (entry.last_mm_count != p_mm_count ||
 			entry.last_surface_counter != p_surface_counter);
 
+	// A from-scratch merged build allocates fresh buffers, runs the replicate
+	// dispatch and builds a BLAS over mm_count * prim_count triangles, all in
+	// this frame's command stream — charge the per-frame build budget before
+	// mutating anything. Deferred: merged_mm_deferred tells Phase 2 to skip
+	// the instance this frame (NOT fall back to the expanded path, which a
+	// plain `false` would trigger); only last_used_frame has been bumped, so
+	// the next frame retries cleanly. Rebake-only refits are not charged.
+	if (structure_changed || !entry.blas_built_once) {
+		if (!_blas_build_budget_allows(p_mm_count * prim_count)) {
+			merged_mm_deferred = true;
+			return false;
+		}
+	}
+
 	entry.indexed = indexed;
 
 	if (structure_changed) {
@@ -2501,12 +2562,6 @@ bool RenderRaytracing::_build_merged_mm_blas(
 // ---------------------------------------------------------------------------
 // TLAS creation (main entry point per frame)
 // ---------------------------------------------------------------------------
-
-_FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_primitive, uint32_t p_indices) {
-	static const uint32_t divisor[RSE::PRIMITIVE_MAX] = { 1, 2, 1, 3, 1 };
-	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
-	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
-}
 
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	if (!p_render_data || !p_render_data->rt_instances) {
@@ -2982,10 +3037,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_pre_refit_size = dirty_blas_update_list.size();
 #endif
 		RTSurfaceData merged_sd;
+		merged_mm_deferred = false;
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
+
+		if (!use_merged && merged_mm_deferred) {
+			// Over the per-frame BLAS build budget — skip this instance for a
+			// frame rather than falling back to the expanded path (which would
+			// build the template BLAS and flood the TLAS for one frame).
+			continue;
+		}
 
 		if (use_merged) {
 			blass.push_back(merged_sd.blas);
@@ -3108,6 +3171,16 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 	finalize_buffers(state);
+
+	// Deliberately print_line, not print_verbose: these lines are the evidence
+	// trail for the 08-17 device-lost investigation — a deferral storm right
+	// before a crash (or the absence of one) is exactly what the next crash
+	// log needs to show. Only fires on frames that actually defer.
+	if (frame_blas_deferred_surfaces > 0u) {
+		// %d, not %u — Godot's vformat has no %u and errors out at print time.
+		print_line(vformat("[RT] BLAS build budget: %d tris submitted, %d surface(s) (%d tris) deferred to a later frame.",
+				(int64_t)frame_blas_build_tris, (int64_t)frame_blas_deferred_surfaces, (int64_t)frame_blas_deferred_tris));
+	}
 
 	return state;
 }

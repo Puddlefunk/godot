@@ -30,6 +30,7 @@
 
 #include "render_forward_clustered_pt.h"
 
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -335,23 +336,37 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			ERR_PRINT_ONCE_ED("Failed to get raytracing pipeline. Aborting render.");
 			return;
 		}
-		RD::RaytracingListID raytracing_list = RD::get_singleton()->raytracing_list_begin();
-		RD::get_singleton()->raytracing_list_bind_raytracing_pipeline(raytracing_list, rt_pipeline);
-		RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, rt_uniform_set, 0);
 
-		// Bindless set 1 can be unset when no bindless textures are live
-		RID bindless_set = raytracing->get_bindless_uniform_set();
-		if (bindless_set.is_valid()) {
-			RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, bindless_set, 1);
+		// Diagnostic guard (2026-08-18 instant PT-toggle device-lost): set the
+		// environment variable SYNTHESIS_PT_SKIP_TRACE=1 to run the FULL PT
+		// bring-up — surface processing, BLAS/TLAS builds, buffer uploads,
+		// uniform sets, output-texture plumbing — while skipping ONLY the
+		// trace dispatch. Output will be garbage/black; that is the point.
+		// Still crashes with this set -> the killer is in the build/upload
+		// command stream. Survives -> it is the dispatch (or something it
+		// consumes) and the haystack shrinks to the trace inputs.
+		static const bool pt_skip_trace = OS::get_singleton()->get_environment("SYNTHESIS_PT_SKIP_TRACE") == "1";
+		if (pt_skip_trace) {
+			WARN_PRINT_ONCE("PT DIAGNOSTIC: trace dispatch DISABLED (SYNTHESIS_PT_SKIP_TRACE=1). Builds/uploads still run; expect garbage output.");
+		} else {
+			RD::RaytracingListID raytracing_list = RD::get_singleton()->raytracing_list_begin();
+			RD::get_singleton()->raytracing_list_bind_raytracing_pipeline(raytracing_list, rt_pipeline);
+			RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, rt_uniform_set, 0);
+
+			// Bindless set 1 can be unset when no bindless textures are live
+			RID bindless_set = raytracing->get_bindless_uniform_set();
+			if (bindless_set.is_valid()) {
+				RD::get_singleton()->raytracing_list_bind_uniform_set(raytracing_list, bindless_set, 1);
+			}
+
+			// Make sure BDA referenced buffers are registered as dependencies -- these cannot be inferred by the draw graph.
+			raytracing->register_raytracing_buffer_dependencies(raytracing_list);
+
+			// Raytracing dispatches at internal (pre-upscale) size
+			Size2i rt_size = rb->get_internal_size();
+			RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
+			RD::get_singleton()->raytracing_list_end();
 		}
-
-		// Make sure BDA referenced buffers are registered as dependencies -- these cannot be inferred by the draw graph.
-		raytracing->register_raytracing_buffer_dependencies(raytracing_list);
-
-		// Raytracing dispatches at internal (pre-upscale) size
-		Size2i rt_size = rb->get_internal_size();
-		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
-		RD::get_singleton()->raytracing_list_end();
 
 		RD::get_singleton()->draw_command_end_label();
 
