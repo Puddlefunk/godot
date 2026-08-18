@@ -599,6 +599,25 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		if (!search_tracker->previous_frame_stages.is_empty()) {
 			// Add to the command the stages the tracker was used on in the previous frame.
 			r_command->previous_stages = r_command->previous_stages | search_tracker->previous_frame_stages;
+			if (write_usage) {
+				// Cross-frame write-after-write memory dependency (2026-08-18).
+				// When this frame's usage is UNCHANGED from last frame's, the
+				// transition branch above cannot fire (different_usage is
+				// false and write_command_or_list_index was reset by
+				// reset_if_outdated), so the only cross-frame dependency was
+				// the execution-only previous_stages above. Spec-wise a WAW
+				// hazard needs a memory dependency, not just execution
+				// ordering; per-frame AS rebuilds and every-frame storage
+				// image writes hit this pattern constantly. Merge the access
+				// masks so the grouped barrier also carries availability of
+				// last frame's write. usage_access already equals the new
+				// access here; in the same-usage case that is also the
+				// previous frame's access, which is the src we need.
+				// (Correctness hardening — measured effect on the reorder=1
+				// device-lost was nil; do not credit this with fixing it.)
+				r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | resource_tracker->usage_access;
+				r_command->memory_barrier.dst_access = r_command->memory_barrier.dst_access | new_usage_access;
+			}
 			search_tracker->previous_frame_stages.clear();
 		}
 
