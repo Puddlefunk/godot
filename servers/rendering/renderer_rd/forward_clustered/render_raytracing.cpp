@@ -2696,7 +2696,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(rt_instance_mask_from_cast_shadows(inst->data->cast_shadows_setting));
+				instance_masks.push_back(rt_instance_mask_from_instance(inst->data->cast_shadows_setting,
+					inst->data->use_baked_light, inst->data->use_dynamic_gi));
 			}
 			continue;
 		}
@@ -2811,7 +2812,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
-				pending.inst_mask = rt_instance_mask_from_cast_shadows(inst->data->cast_shadows_setting);
+				pending.inst_mask = rt_instance_mask_from_instance(inst->data->cast_shadows_setting,
+					inst->data->use_baked_light, inst->data->use_dynamic_gi);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -3017,10 +3019,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT;
 			}
 			instance_flags.push_back(inst_flags);
-			// Ray-type participation from GeometryInstance3D.cast_shadow.
-			// Off = no SHADOW bit; Shadows Only = SHADOW bit alone, i.e.
-			// invisible to camera and bounce rays.
-			instance_masks.push_back(rt_instance_mask_from_cast_shadows(inst->data->cast_shadows_setting));
+			// Ray-type participation from GeometryInstance3D.cast_shadow
+			// AND gi_mode. Off = no SHADOW bit; Shadows Only = SHADOW bit
+			// alone, i.e. invisible to camera and bounce rays; gi_mode
+			// Disabled = no INDIRECT bit (see rt_instance_mask_from_instance).
+			instance_masks.push_back(rt_instance_mask_from_instance(inst->data->cast_shadows_setting,
+					inst->data->use_baked_light, inst->data->use_dynamic_gi));
 
 			surf = surf->next;
 		}

@@ -149,6 +149,101 @@ float rt_cone_width_at_hit() {
 	return gl_HitTEXT * pixel_spread;
 }
 
+/// One vertex position in BLAS OBJECT space, for both vertex layouts -- i.e.
+/// exactly the space `gl_ObjectToWorldEXT` expects, in both cases.
+///
+/// Compressed surfaces store position as three 16-bit unorms normalised into
+/// the surface AABB (position_stride is 4x uint16: x, y, z, then the tangent
+/// angle that fetch_tbn_compressed_vertex reads out of the high half of the
+/// second word). The acceleration structure was built from those unorms
+/// directly, so for compressed geometry BLAS object space IS the unit cube and
+/// the AABB decompression is baked into the instance transform -- which is why
+/// the model matrix has to be recovered as `gl_ObjectToWorldEXT *
+/// inv_aabb_xform` (raytracing_custom_fragment_inc, and compute_triplanar_coords
+/// below goes the other way with `aabb_xform * object_hit_pos`).
+///
+/// So this deliberately does NOT apply aabb_xform: applying it and then
+/// gl_ObjectToWorldEXT would count the AABB scale twice and inflate world areas
+/// by that factor squared.
+vec3 rt_fetch_object_position(in GeometryData geom, uint idx) {
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		Uint32Buffer vb = Uint32Buffer(geom.vertex_address);
+		uint w0 = vb.v[idx * 2u + 0u];
+		uint w1 = vb.v[idx * 2u + 1u];
+		return vec3(float(w0 & 0xFFFFu), float(w0 >> 16), float(w1 & 0xFFFFu)) / 65535.0;
+	}
+	FloatBuffer vb_f = FloatBuffer(geom.vertex_address);
+	uint stride_floats = geom.position_stride >> 2;
+	return vec3(vb_f.v[idx * stride_floats + 0u],
+			vb_f.v[idx * stride_floats + 1u],
+			vb_f.v[idx * stride_floats + 2u]);
+}
+
+/// UV units per world unit for the CURRENT triangle, or 0 when undeterminable.
+///
+/// THE FOLLOW-UP FIXES-2026-08-17 WROTE DOWN. That session gave triplanar
+/// sampling a ray-cone LOD and deliberately left mesh-UV sampling at LOD 0,
+/// because "texel density per world unit is unknowable without per-triangle UV
+/// area, and no artifact has been observed there (marble is clean)" -- with the
+/// note that distant mesh-UV materials sparkling would be the trigger to fix
+/// it. Alpha-cut foliage is the first mesh-UV content in the project that is
+/// thin, high-contrast and viewed at range, and it sparkles: a 2k atlas read at
+/// LOD 0 across sub-pixel quads lands on a different texel every time the
+/// camera twitches.
+///
+/// The area is obtainable right here. The hit shader already has the three
+/// indices; their UVs and positions are two buffer reads away.
+///
+/// WORLD area, not object area: instances are scaled -- MultiMesh foliage
+/// especially, where every blade carries its own random scale -- so object
+/// space would be wrong by whatever that scale happens to be.
+///
+/// Returns 0 rather than guessing whenever the inputs are degenerate, and 0
+/// means "stay at LOD 0", i.e. exactly the behaviour before this existed.
+float rt_mesh_uv_density(in GeometryData geom, uint i0, uint i1, uint i2) {
+	if (geom.vertex_address == 0ul || geom.attribute_address == 0ul) {
+		return 0.0;
+	}
+	// 2D surfaces store two floats per position; there is no triangle area to
+	// speak of and the third read would be another vertex's x.
+	if ((geom.flags & FLAG_COMPRESSED) == 0u && geom.position_stride < 12u) {
+		return 0.0;
+	}
+
+	// Barycentric selectors pull the three corner UVs through the existing
+	// decoder rather than duplicating its compressed/uncompressed branch here.
+	vec2 uv0 = fetch_uv(geom, i0, i1, i2, vec3(1.0, 0.0, 0.0));
+	vec2 uv1 = fetch_uv(geom, i0, i1, i2, vec3(0.0, 1.0, 0.0));
+	vec2 uv2 = fetch_uv(geom, i0, i1, i2, vec3(0.0, 0.0, 1.0));
+	float uv_area = abs((uv1.x - uv0.x) * (uv2.y - uv0.y) - (uv2.x - uv0.x) * (uv1.y - uv0.y));
+	if (uv_area <= 1e-12) {
+		return 0.0;
+	}
+
+	vec3 p0 = vec3(gl_ObjectToWorldEXT * vec4(rt_fetch_object_position(geom, i0), 1.0));
+	vec3 p1 = vec3(gl_ObjectToWorldEXT * vec4(rt_fetch_object_position(geom, i1), 1.0));
+	vec3 p2 = vec3(gl_ObjectToWorldEXT * vec4(rt_fetch_object_position(geom, i2), 1.0));
+	float world_area = length(cross(p1 - p0, p2 - p0));
+	if (world_area <= 1e-12) {
+		return 0.0;
+	}
+
+	float density = sqrt(uv_area / world_area);
+	return (isinf(density) || isnan(density)) ? 0.0 : density;
+}
+
+/// Mip level for a mesh-UV texture read, mirroring the triplanar path's
+/// footprint-times-texture-size formula so both take the same shape.
+float rt_mesh_uv_lod(uint tex_idx, float density) {
+	if (density <= 0.0) {
+		return 0.0;
+	}
+	vec2 tex_size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)],
+			SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
+	float texels = rt_cone_width_at_hit() * density * max(tex_size.x, tex_size.y);
+	return clamp(log2(max(texels, 1.0)), 0.0, 15.0);
+}
+
 /// sample_material_texture with an explicit LOD. Point-filtered (pixel art)
 /// materials keep nearest filtering within the selected mip.
 vec4 sample_material_texture_lod(uint tex_idx, vec2 uv, uint mat_flags, float lod) {
@@ -765,7 +860,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 			rayQueryEXT spec_rq;
 			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
+					RT_MASK_INDIRECT, spec_origin, 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(

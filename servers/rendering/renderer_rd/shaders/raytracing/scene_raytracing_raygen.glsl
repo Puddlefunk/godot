@@ -433,13 +433,33 @@ void main() {
 		tc = compute_triplanar_coords(h, mat, geometries[h.geometry_idx]);
 	}
 
+	// Mesh-UV texel density, computed ONCE per hit and shared by every map
+	// below. Zero for triplanar (which has its own per-axis footprint) and for
+	// anything whose triangle area cannot be established, and zero means the
+	// LOD comes out 0 -- the behaviour these paths had before mesh-UV LOD
+	// existed. See rt_mesh_uv_density.
+	//
+	// One incidental change below: the normal map moves from
+	// sample_bindless_texture (always linear) to sample_material_texture_lod,
+	// so a point-filtered material's normal map is now point-filtered within
+	// its mip -- which is what albedo/orm/emission already did.
+	float mesh_uv_density = 0.0;
+	if (!triplanar) {
+		uint mi0, mi1, mi2;
+		get_triangle_indices(geometries[h.geometry_idx], mi0, mi1, mi2);
+		mesh_uv_density = rt_mesh_uv_density(geometries[h.geometry_idx], mi0, mi1, mi2);
+		// UV1 scale stretches the mapping, so it stretches texel density too.
+		mesh_uv_density *= max(max(abs(mat.uv1_scale.x), abs(mat.uv1_scale.y)), 1e-6);
+	}
+
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
 		vec3 normal_sample = triplanar
 				? sample_material_texture_triplanar(mat.normal_texture_idx, tc, mat.flags).rgb
-				: sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
+				: sample_material_texture_lod(mat.normal_texture_idx, uv, mat.flags,
+						rt_mesh_uv_lod(mat.normal_texture_idx, mesh_uv_density)).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
 		final_normal = triplanar
@@ -450,11 +470,13 @@ void main() {
 	// Texture sampling.
 	vec4 albedo_tex = triplanar
 			? sample_material_texture_triplanar(mat.albedo_texture_idx, tc, mat.flags)
-			: sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
+			: sample_material_texture_lod(mat.albedo_texture_idx, uv, mat.flags,
+					rt_mesh_uv_lod(mat.albedo_texture_idx, mesh_uv_density));
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
 	vec4 orm_tex = triplanar
 			? sample_material_texture_triplanar(mat.orm_texture_idx, tc, mat.flags)
-			: sample_material_texture(mat.orm_texture_idx, uv, mat.flags);
+			: sample_material_texture_lod(mat.orm_texture_idx, uv, mat.flags,
+					rt_mesh_uv_lod(mat.orm_texture_idx, mesh_uv_density));
 	vec3 orm = orm_tex.rgb;
 	// Channel selectors, packed host-side (bits 0-3 roughness, bits 4-7
 	// metallic; 0=R 1=G 2=B 3=A 4=grayscale). Raster honours BaseMaterial3D's
@@ -469,7 +491,8 @@ void main() {
 	if ((mat.flags & 2u) != 0u) {
 		emissive = (triplanar
 				? sample_material_texture_triplanar(mat.emission_texture_idx, tc, mat.flags)
-				: sample_material_texture(mat.emission_texture_idx, uv, mat.flags)).rgb * mat.emission_color * mat.emission_strength;
+				: sample_material_texture_lod(mat.emission_texture_idx, uv, mat.flags,
+						rt_mesh_uv_lod(mat.emission_texture_idx, mesh_uv_density))).rgb * mat.emission_color * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
 	}
 

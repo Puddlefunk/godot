@@ -294,6 +294,37 @@ inline uint32_t rt_instance_mask_from_cast_shadows(RSE::ShadowCastingSetting p_s
 	}
 }
 
+// Second axis of participation: GeometryInstance3D.gi_mode.
+//
+// GI_MODE_DISABLED means the instance is in neither the baked nor the dynamic
+// GI path, and `use_baked_light || use_dynamic_gi` is exactly how the raster
+// side spells that test (render_forward_clustered.cpp:4656). The PT equivalent
+// of "not in GI" is dropping out of BOUNCE rays: the instance stays visible to
+// the camera and still casts shadows if its shadow setting says so, but no
+// indirect ray can hit it, so it neither occludes nor colours the bounce.
+//
+// WHY IT EXISTS: dense alpha-tested foliage. Every bounce ray that hits a
+// grass card pays an any-hit shader off the fast traversal path, and because
+// those hits are stochastic and the geometry is thin, the surviving occlusion
+// is noise that swims frame to frame. Excluding foliage from INDIRECT is the
+// standard trade -- lose grass-on-ground bounce occlusion, which nobody can
+// point to, to remove a per-bounce cost and a moving artifact that everyone
+// can.
+//
+// SAFE BY DEFAULT: MeshInstance3D defaults to GI_MODE_STATIC, i.e.
+// use_baked_light = true, so this is strictly opt-in and no existing content
+// changes behaviour. Combined with cast_shadow = Off an instance reduces to
+// RT_INSTANCE_MASK_CAMERA -- seen, and nothing else. The mask can never reach
+// zero: Shadows Only keeps SHADOW, everything else keeps CAMERA.
+inline uint32_t rt_instance_mask_from_instance(RSE::ShadowCastingSetting p_setting,
+		bool p_use_baked_light, bool p_use_dynamic_gi) {
+	uint32_t mask = rt_instance_mask_from_cast_shadows(p_setting);
+	if (!(p_use_baked_light || p_use_dynamic_gi)) {
+		mask &= ~(uint32_t)RT_INSTANCE_MASK_INDIRECT;
+	}
+	return mask;
+}
+
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
 struct RTProceduralState {
 	AABB culling_aabb;
