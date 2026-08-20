@@ -2528,7 +2528,13 @@ void VoxelGeneratorGraph::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("compile"), &Self::_b_compile);
 
-	// ClassDB::bind_method(D_METHOD("generate_single"), &Self::_b_generate_single);
+	// Bound 2026-08-20. Callers that need to agree with the MESH -- prop
+	// seating, gameplay queries -- cannot use raycast_sdf_approx for it: that
+	// marches at sub-voxel spacing and finds crossings the mesher cannot
+	// represent, because the mesher only ever samples voxel corners and
+	// interpolates linearly between them. Reproducing the drawn surface needs
+	// the corner VALUES, which is this.
+	ClassDB::bind_method(D_METHOD("generate_single", "position"), &Self::_b_generate_single);
 	ClassDB::bind_method(D_METHOD("debug_analyze_range", "min_pos", "max_pos"), &Self::_b_debug_analyze_range);
 
 	ClassDB::bind_method(

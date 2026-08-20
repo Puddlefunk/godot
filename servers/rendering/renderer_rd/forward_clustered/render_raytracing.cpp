@@ -651,7 +651,19 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 // claim EVERY from-scratch build charges; only the two paths above do.)
 bool RenderRaytracing::_blas_build_budget_allows(uint32_t p_tris) {
 	static const uint32_t BLAS_BUILD_TRI_BUDGET = (uint32_t)GLOBAL_GET("rendering/pathtracing/max_blas_build_triangles_per_frame");
+	// `p_tris >= BUDGET` is the second half of the always-grant rule above,
+	// and its absence livelocked the queue (2026-08-20). `frame_blas_build_tris
+	// == 0u` only rescues an oversized surface that happens to be considered
+	// FIRST; anything charged earlier in the same frame makes the counter
+	// non-zero and the arithmetic can never pass again. Deferring does not
+	// help a surface larger than the whole budget, because no later frame is
+	// emptier -- it just never builds, has no acceleration structure, and
+	// goes invisible to every ray while spamming the deferral log forever.
+	//
+	// Observed as a fixed "4 surface(s) (308686 tris) deferred" repeating
+	// every frame: ~77k triangles each against a 16,384 budget.
 	if (BLAS_BUILD_TRI_BUDGET == 0u || frame_blas_build_tris == 0u ||
+			p_tris >= BLAS_BUILD_TRI_BUDGET ||
 			frame_blas_build_tris + p_tris <= BLAS_BUILD_TRI_BUDGET) {
 		frame_blas_build_tris += p_tris;
 		return true;
