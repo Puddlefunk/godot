@@ -139,6 +139,9 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_voxel_mesher_tetra_same_lod_border);
 	VOXEL_TEST(test_voxel_mesher_tetra_collision_surface);
 	VOXEL_TEST(test_voxel_mesher_tetra_collision_border);
+	VOXEL_TEST(test_voxel_mesher_tetra_transition_variants);
+	VOXEL_TEST(test_voxel_mesher_tetra_mixed_lod_border);
+	VOXEL_TEST(test_voxel_mesher_tetra_transition_toggle);
 	VOXEL_TEST(test_threaded_task_runner_misc);
 	VOXEL_TEST(test_threaded_task_runner_debug_names);
 	VOXEL_TEST(test_task_priority_values);

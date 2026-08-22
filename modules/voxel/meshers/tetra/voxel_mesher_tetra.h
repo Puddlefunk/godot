@@ -26,7 +26,6 @@ namespace zylann::voxel {
 // uniform vertex color and triplanar UVs derived from the un-warped surface
 // position, matching the source implementation.
 //
-// LOD sampling is supported. Coarse/fine transition cells are not emitted yet.
 class VoxelMesherTetra : public VoxelMesher {
 	GDCLASS(VoxelMesherTetra, VoxelMesher)
 
@@ -99,6 +98,8 @@ public:
 	// sign +1). Required for normal-mapped PBR materials.
 	void set_generate_tangents(bool p_enabled);
 	bool get_generate_tangents() const;
+	void set_lod_transitions_enabled(bool p_enabled);
+	bool get_lod_transitions_enabled() const;
 
 	// Output transform baked into emitted vertex positions:
 	// final = local * vertex_scale + vertex_offset. Identity by default.
@@ -157,6 +158,7 @@ private:
 		Color default_color = Color(1, 1, 1, 1);
 		float uv_scale = 0.35f;
 		bool generate_tangents = false;
+		bool lod_transitions_enabled = true;
 		bool texturing_enabled = false;
 		float vertex_scale = 1.f;
 		Vector3 vertex_offset;

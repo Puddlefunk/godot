@@ -9,6 +9,7 @@
 #include "../../util/godot/core/packed_arrays.h"
 #include "../../util/profiling.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -247,11 +248,15 @@ struct BuildScratch {
 	StdVector<DVec3> tri_positions; // 3 entries per triangle, global voxel units.
 	StdVector<uint64_t> tri_keys; // Weld identity per triangle corner.
 	StdVector<uint8_t> tri_emit; // 1 entry per triangle: inside the emission window?
+	StdVector<uint8_t> tri_transition_on;
+	StdVector<uint8_t> tri_transition_off;
 
 	void clear_mesh() {
 		tri_positions.clear();
 		tri_keys.clear();
 		tri_emit.clear();
+		tri_transition_on.clear();
+		tri_transition_off.clear();
 	}
 };
 
@@ -445,15 +450,124 @@ void VoxelMesherTetra::build_internal(
 
 	const double area_epsilon = 1.0e-8 * world_step * world_step * world_step * world_step;
 
+	const Vector3i parent_source_size(
+			(buffer_size.x + 1) / 2, (buffer_size.y + 1) / 2, (buffer_size.z + 1) / 2);
+	const Vector3i parent_lattice_points(
+			(parent_source_size.x - 1) * r + 1,
+			(parent_source_size.y - 1) * r + 1,
+			(parent_source_size.z - 1) * r + 1);
+
+	const auto interpolate_parent_lattice_density = [&](int px, int py, int pz) -> double {
+		const int x0 = MIN(px / r, parent_source_size.x - 2);
+		const int y0 = MIN(py / r, parent_source_size.y - 2);
+		const int z0 = MIN(pz / r, parent_source_size.z - 2);
+		const double fx = static_cast<double>(px) / r - x0;
+		const double fy = static_cast<double>(py) / r - y0;
+		const double fz = static_cast<double>(pz) / r - z0;
+		const int sx = x0 * 2;
+		const int sy = y0 * 2;
+		const int sz = z0 * 2;
+
+		const double c000 = sdf_samples[sample_index(sx, sy, sz)];
+		const double c100 = sdf_samples[sample_index(sx + 2, sy, sz)];
+		const double c010 = sdf_samples[sample_index(sx, sy + 2, sz)];
+		const double c110 = sdf_samples[sample_index(sx + 2, sy + 2, sz)];
+		const double c001 = sdf_samples[sample_index(sx, sy, sz + 2)];
+		const double c101 = sdf_samples[sample_index(sx + 2, sy, sz + 2)];
+		const double c011 = sdf_samples[sample_index(sx, sy + 2, sz + 2)];
+		const double c111 = sdf_samples[sample_index(sx + 2, sy + 2, sz + 2)];
+		const double x00 = c000 + (c100 - c000) * fx;
+		const double x10 = c010 + (c110 - c010) * fx;
+		const double x01 = c001 + (c101 - c001) * fx;
+		const double x11 = c011 + (c111 - c011) * fx;
+		const double y0v = x00 + (x10 - x00) * fy;
+		const double y1v = x01 + (x11 - x01) * fy;
+		return -(y0v + (y1v - y0v) * fz);
+	};
+	StdVector<float> parent_densities;
+	if (input.lod_hint && params.lod_transitions_enabled) {
+		parent_densities.resize(
+				static_cast<size_t>(parent_lattice_points.x) * parent_lattice_points.y * parent_lattice_points.z);
+		size_t density_index = 0;
+		for (int pz = 0; pz < parent_lattice_points.z; ++pz) {
+			for (int py = 0; py < parent_lattice_points.y; ++py) {
+				for (int px = 0; px < parent_lattice_points.x; ++px) {
+					parent_densities[density_index++] = interpolate_parent_lattice_density(px, py, pz);
+				}
+			}
+		}
+	}
+	const auto sample_parent_lattice_density = [&](int px, int py, int pz) -> double {
+		const size_t i = static_cast<size_t>(px) + static_cast<size_t>(py) * parent_lattice_points.x +
+				static_cast<size_t>(pz) * parent_lattice_points.x * parent_lattice_points.y;
+		return parent_densities[i];
+	};
+
+	const auto sample_parent_tetra_density = [&](double lx, double ly, double lz) -> double {
+		const double fine_coords[3] = { lx, ly, lz };
+		const int parent_sizes[3] = { parent_lattice_points.x, parent_lattice_points.y, parent_lattice_points.z };
+		int base[3];
+		double f[3];
+		for (int axis = 0; axis < 3; ++axis) {
+			const double q = fine_coords[axis] * 0.5;
+			base[axis] = MIN(static_cast<int>(std::floor(q)), parent_sizes[axis] - 2);
+			f[axis] = q - base[axis];
+		}
+
+		double values[8];
+		for (int ci = 0; ci < 8; ++ci) {
+			values[ci] = sample_parent_lattice_density(
+					base[0] + CUBE_CORNERS[ci][0],
+					base[1] + CUBE_CORNERS[ci][1],
+					base[2] + CUBE_CORNERS[ci][2]);
+		}
+
+		int axes[3] = { 0, 1, 2 };
+		if (f[axes[0]] < f[axes[1]]) {
+			std::swap(axes[0], axes[1]);
+		}
+		if (f[axes[1]] < f[axes[2]]) {
+			std::swap(axes[1], axes[2]);
+		}
+		if (f[axes[0]] < f[axes[1]]) {
+			std::swap(axes[0], axes[1]);
+		}
+
+		const auto corner_from_axes = [](int a, int b) -> int {
+			int coords[3] = { 0, 0, 0 };
+			if (a >= 0) {
+				coords[a] = 1;
+			}
+			if (b >= 0) {
+				coords[b] = 1;
+			}
+			for (int ci = 0; ci < 8; ++ci) {
+				if (CUBE_CORNERS[ci][0] == coords[0] && CUBE_CORNERS[ci][1] == coords[1] &&
+						CUBE_CORNERS[ci][2] == coords[2]) {
+					return ci;
+				}
+			}
+			return 0;
+		};
+
+		const int c1 = corner_from_axes(axes[0], -1);
+		const int c2 = corner_from_axes(axes[0], axes[1]);
+		return values[0] * (1.0 - f[axes[0]]) + values[c1] * (f[axes[0]] - f[axes[1]]) +
+				values[c2] * (f[axes[1]] - f[axes[2]]) + values[6] * f[axes[2]];
+	};
+
 	{
 		ZN_PROFILE_SCOPE_NAMED("March");
 
 		DVec3 corner_positions[8];
 		double corner_values[8];
 		uint64_t corner_keys[8];
+		uint8_t corner_border_masks[8];
 		int inside[4];
 		int outside[4];
 		int slots[4];
+		uint8_t transition_on = 0;
+		uint8_t transition_off = 0;
 
 		const auto emit_edge_vertex = [&](int i, int j, DVec3 &out_pos, uint64_t &out_key) {
 			int lo = i;
@@ -464,6 +578,11 @@ void VoxelMesherTetra::build_internal(
 			}
 			out_pos = edge_interp(corner_positions[lo], corner_positions[hi], corner_values[lo], corner_values[hi]);
 			out_key = make_edge_key(corner_keys[i], corner_keys[j]);
+			const uint8_t modified_faces = (corner_border_masks[i] | corner_border_masks[j]) & transition_on;
+			if (modified_faces != 0) {
+				out_key ^= static_cast<uint64_t>(modified_faces) * 0xD6E8FEB86659FD93ull;
+				out_key ^= out_key >> 31;
+			}
 		};
 
 		const auto add_triangle = [&](const DVec3 &a, uint64_t key_a, const DVec3 &b, uint64_t key_b, const DVec3 &c,
@@ -480,117 +599,186 @@ void VoxelMesherTetra::build_internal(
 			scratch.tri_keys.push_back(key_b);
 			scratch.tri_keys.push_back(key_c);
 			scratch.tri_emit.push_back(emit ? 1 : 0);
+			scratch.tri_transition_on.push_back(transition_on);
+			scratch.tri_transition_off.push_back(transition_off);
+		};
+
+		const auto polygonise_cell = [&](bool emit) {
+			for (int ti = 0; ti < 6; ++ti) {
+				const int8_t *tet = TETRAHEDRA[ti];
+				int inside_count = 0;
+				int outside_count = 0;
+				for (int k = 0; k < 4; ++k) {
+					const int corner_index = tet[k];
+					if (corner_values[corner_index] >= 0.0) {
+						inside[inside_count++] = corner_index;
+					} else {
+						outside[outside_count++] = corner_index;
+					}
+				}
+				if (inside_count == 0 || inside_count == 4) {
+					continue;
+				}
+
+				if (inside_count == 1) {
+					const int a = inside[0];
+					slots[0] = tet_slot_of(tet, a);
+					slots[1] = tet_slot_of(tet, outside[0]);
+					slots[2] = tet_slot_of(tet, outside[1]);
+					slots[3] = tet_slot_of(tet, outside[2]);
+					DVec3 p0, p1, p2;
+					uint64_t k0, k1, k2;
+					emit_edge_vertex(a, outside[0], p0, k0);
+					emit_edge_vertex(a, outside[1], p1, k1);
+					emit_edge_vertex(a, outside[2], p2, k2);
+					if (permutation_is_even(slots)) {
+						add_triangle(p0, k0, p1, k1, p2, k2, emit);
+					} else {
+						add_triangle(p0, k0, p2, k2, p1, k1, emit);
+					}
+				} else if (inside_count == 3) {
+					const int a = outside[0];
+					slots[0] = tet_slot_of(tet, a);
+					slots[1] = tet_slot_of(tet, inside[0]);
+					slots[2] = tet_slot_of(tet, inside[1]);
+					slots[3] = tet_slot_of(tet, inside[2]);
+					DVec3 q0, q1, q2;
+					uint64_t j0, j1, j2;
+					emit_edge_vertex(a, inside[2], q0, j0);
+					emit_edge_vertex(a, inside[1], q1, j1);
+					emit_edge_vertex(a, inside[0], q2, j2);
+					if (permutation_is_even(slots)) {
+						add_triangle(q0, j0, q1, j1, q2, j2, emit);
+					} else {
+						add_triangle(q0, j0, q2, j2, q1, j1, emit);
+					}
+				} else {
+					const int a = inside[0];
+					const int b = inside[1];
+					const int c = outside[0];
+					const int d = outside[1];
+					slots[0] = tet_slot_of(tet, a);
+					slots[1] = tet_slot_of(tet, b);
+					slots[2] = tet_slot_of(tet, c);
+					slots[3] = tet_slot_of(tet, d);
+					DVec3 ac, ad, bc, bd;
+					uint64_t ac_key, ad_key, bc_key, bd_key;
+					emit_edge_vertex(a, c, ac, ac_key);
+					emit_edge_vertex(a, d, ad, ad_key);
+					emit_edge_vertex(b, c, bc, bc_key);
+					emit_edge_vertex(b, d, bd, bd_key);
+					if (permutation_is_even(slots)) {
+						add_triangle(ac, ac_key, bd, bd_key, bc, bc_key, emit);
+						add_triangle(ac, ac_key, ad, ad_key, bd, bd_key, emit);
+					} else {
+						add_triangle(ac, ac_key, bc, bc_key, bd, bd_key, emit);
+						add_triangle(ac, ac_key, bd, bd_key, ad, ad_key, emit);
+					}
+				}
+			}
 		};
 
 		for (int cx = acc_min; cx < acc_max.x; ++cx) {
 			for (int cy = acc_min; cy < acc_max.y; ++cy) {
 				for (int cz = acc_min; cz < acc_max.z; ++cz) {
-					// Sign test on the eight shared corners before any other
-					// work; exact, not a heuristic (see source).
 					bool any_inside = false;
 					bool any_outside = false;
+					double base_values[8];
+					double parent_values[8];
 					for (int ci = 0; ci < 8; ++ci) {
 						const int lx = cx + CUBE_CORNERS[ci][0];
 						const int ly = cy + CUBE_CORNERS[ci][1];
 						const int lz = cz + CUBE_CORNERS[ci][2];
 						const double value = scratch.densities[lattice_index(lx, ly, lz)];
 						corner_values[ci] = value;
-						corner_keys[ci] = global_lattice_id(lx, ly, lz);
+						base_values[ci] = value;
+						parent_values[ci] = value;
 						if (value >= 0.0) {
 							any_inside = true;
 						} else {
 							any_outside = true;
 						}
 					}
-					if (!(any_inside && any_outside)) {
+					const bool emit = cx >= emit_min && cy >= emit_min && cz >= emit_min && cx < emit_max.x &&
+							cy < emit_max.y && cz < emit_max.z;
+					uint8_t cell_border_mask = 0;
+					if (emit) {
+						cell_border_mask |= cx == emit_min ? 1 : 0;
+						cell_border_mask |= cx == emit_max.x - 1 ? 2 : 0;
+						cell_border_mask |= cy == emit_min ? 4 : 0;
+						cell_border_mask |= cy == emit_max.y - 1 ? 8 : 0;
+						cell_border_mask |= cz == emit_min ? 16 : 0;
+						cell_border_mask |= cz == emit_max.z - 1 ? 32 : 0;
+					}
+
+					for (int ci = 0; ci < 8; ++ci) {
+						uint8_t mask = 0;
+						mask |= (cell_border_mask & 1) && CUBE_CORNERS[ci][0] == 0 ? 1 : 0;
+						mask |= (cell_border_mask & 2) && CUBE_CORNERS[ci][0] == 1 ? 2 : 0;
+						mask |= (cell_border_mask & 4) && CUBE_CORNERS[ci][1] == 0 ? 4 : 0;
+						mask |= (cell_border_mask & 8) && CUBE_CORNERS[ci][1] == 1 ? 8 : 0;
+						mask |= (cell_border_mask & 16) && CUBE_CORNERS[ci][2] == 0 ? 16 : 0;
+						mask |= (cell_border_mask & 32) && CUBE_CORNERS[ci][2] == 1 ? 32 : 0;
+						corner_border_masks[ci] = mask;
+					}
+
+					const bool transition_cell = input.lod_hint && params.lod_transitions_enabled && cell_border_mask != 0;
+					if (transition_cell) {
+						bool possible_inside = false;
+						bool possible_outside = false;
+						for (int ci = 0; ci < 8; ++ci) {
+							if (corner_border_masks[ci] != 0) {
+								const int lx = cx + CUBE_CORNERS[ci][0];
+								const int ly = cy + CUBE_CORNERS[ci][1];
+								const int lz = cz + CUBE_CORNERS[ci][2];
+								parent_values[ci] = sample_parent_tetra_density(lx, ly, lz);
+							}
+							possible_inside |= base_values[ci] >= 0.0 || parent_values[ci] >= 0.0;
+							possible_outside |= base_values[ci] < 0.0 || parent_values[ci] < 0.0;
+						}
+						if (!(possible_inside && possible_outside)) {
+							continue;
+						}
+					} else if (!(any_inside && any_outside)) {
 						continue;
 					}
 
-					const bool emit = cx >= emit_min && cy >= emit_min && cz >= emit_min && cx < emit_max.x &&
-							cy < emit_max.y && cz < emit_max.z;
-
-					// Corner positions in LOD0 world-voxel units.
 					for (int ci = 0; ci < 8; ++ci) {
 						const int lx = cx + CUBE_CORNERS[ci][0];
 						const int ly = cy + CUBE_CORNERS[ci][1];
 						const int lz = cz + CUBE_CORNERS[ci][2];
+						corner_keys[ci] = global_lattice_id(lx, ly, lz);
 						corner_positions[ci] = DVec3(
 								static_cast<double>(padded_origin.x) + lx * world_step,
 								static_cast<double>(padded_origin.y) + ly * world_step,
 								static_cast<double>(padded_origin.z) + lz * world_step);
 					}
 
-					for (int ti = 0; ti < 6; ++ti) {
-						const int8_t *tet = TETRAHEDRA[ti];
-						int inside_count = 0;
-						int outside_count = 0;
-						for (int k = 0; k < 4; ++k) {
-							const int corner_index = tet[k];
-							if (corner_values[corner_index] >= 0.0) {
-								inside[inside_count++] = corner_index;
-							} else {
-								outside[outside_count++] = corner_index;
+					if (transition_cell) {
+						uint8_t subset = cell_border_mask;
+						for (;;) {
+							transition_on = subset;
+							transition_off = cell_border_mask & ~subset;
+							for (int ci = 0; ci < 8; ++ci) {
+								if ((corner_border_masks[ci] & subset) != 0) {
+									corner_values[ci] = parent_values[ci];
+								} else {
+									corner_values[ci] = base_values[ci];
+								}
 							}
+							polygonise_cell(true);
+							if (subset == 0) {
+								break;
+							}
+							subset = (subset - 1) & cell_border_mask;
 						}
-						if (inside_count == 0 || inside_count == 4) {
-							continue;
+					} else {
+						transition_on = 0;
+						transition_off = 0;
+						for (int ci = 0; ci < 8; ++ci) {
+							corner_border_masks[ci] = 0;
 						}
-
-						if (inside_count == 1) {
-							const int a = inside[0];
-							slots[0] = tet_slot_of(tet, a);
-							slots[1] = tet_slot_of(tet, outside[0]);
-							slots[2] = tet_slot_of(tet, outside[1]);
-							slots[3] = tet_slot_of(tet, outside[2]);
-							DVec3 p0, p1, p2;
-							uint64_t k0, k1, k2;
-							emit_edge_vertex(a, outside[0], p0, k0);
-							emit_edge_vertex(a, outside[1], p1, k1);
-							emit_edge_vertex(a, outside[2], p2, k2);
-							if (permutation_is_even(slots)) {
-								add_triangle(p0, k0, p1, k1, p2, k2, emit);
-							} else {
-								add_triangle(p0, k0, p2, k2, p1, k1, emit);
-							}
-						} else if (inside_count == 3) {
-							const int a = outside[0];
-							slots[0] = tet_slot_of(tet, a);
-							slots[1] = tet_slot_of(tet, inside[0]);
-							slots[2] = tet_slot_of(tet, inside[1]);
-							slots[3] = tet_slot_of(tet, inside[2]);
-							DVec3 q0, q1, q2;
-							uint64_t j0, j1, j2;
-							emit_edge_vertex(a, inside[2], q0, j0);
-							emit_edge_vertex(a, inside[1], q1, j1);
-							emit_edge_vertex(a, inside[0], q2, j2);
-							if (permutation_is_even(slots)) {
-								add_triangle(q0, j0, q1, j1, q2, j2, emit);
-							} else {
-								add_triangle(q0, j0, q2, j2, q1, j1, emit);
-							}
-						} else {
-							const int a = inside[0];
-							const int b = inside[1];
-							const int c = outside[0];
-							const int d = outside[1];
-							slots[0] = tet_slot_of(tet, a);
-							slots[1] = tet_slot_of(tet, b);
-							slots[2] = tet_slot_of(tet, c);
-							slots[3] = tet_slot_of(tet, d);
-							DVec3 ac, ad, bc, bd;
-							uint64_t ac_key, ad_key, bc_key, bd_key;
-							emit_edge_vertex(a, c, ac, ac_key);
-							emit_edge_vertex(a, d, ad, ad_key);
-							emit_edge_vertex(b, c, bc, bc_key);
-							emit_edge_vertex(b, d, bd, bd_key);
-							if (permutation_is_even(slots)) {
-								add_triangle(ac, ac_key, bd, bd_key, bc, bc_key, emit);
-								add_triangle(ac, ac_key, ad, ad_key, bd, bd_key, emit);
-							} else {
-								add_triangle(ac, ac_key, bc, bc_key, bd, bd_key, emit);
-								add_triangle(ac, ac_key, bd, bd_key, ad, ad_key, emit);
-							}
-						}
+						polygonise_cell(emit);
 					}
 				}
 			}
@@ -660,6 +848,7 @@ void VoxelMesherTetra::build_internal(
 	PackedColorArray out_colors;
 	PackedVector2Array out_uvs;
 	PackedFloat32Array out_tangents;
+	PackedFloat32Array out_lod_attribs;
 	PackedFloat32Array out_tex_attribs;
 	StdUnorderedMap<uint64_t, int> collision_vertex_indices;
 
@@ -749,9 +938,13 @@ void VoxelMesherTetra::build_internal(
 		if (params.generate_tangents) {
 			out_tangents.resize(max_vertices * 4);
 		}
+		if (input.lod_hint) {
+			out_lod_attribs.resize(max_vertices * 4);
+		}
 		if (params.texturing_enabled) {
 			out_tex_attribs.resize(max_vertices * 2);
 		}
+		float *lod_attribs_w = input.lod_hint ? out_lod_attribs.ptrw() : nullptr;
 		float *tex_attribs_w = params.texturing_enabled ? out_tex_attribs.ptrw() : nullptr;
 		Vector3 *vertices_w = out_vertices.ptrw();
 		Vector3 *normals_w = out_normals.ptrw();
@@ -847,6 +1040,8 @@ void VoxelMesherTetra::build_internal(
 			const DVec3 *emit_positions[3] = { &warped_a, &warped_c, &warped_b };
 			const DVec3 *source_positions[3] = { &a, &c, &b };
 			const uint64_t emit_keys[3] = { key_a, key_c, key_b };
+			const uint32_t transition_flags = static_cast<uint32_t>(scratch.tri_transition_on[t]) |
+					(static_cast<uint32_t>(scratch.tri_transition_off[t]) << 6);
 			for (int corner = 0; corner < 3; ++corner) {
 				const DVec3 p = (*emit_positions[corner]) * v_scale + v_offset;
 				vertices_w[vertex_count] = Vector3(
@@ -854,6 +1049,13 @@ void VoxelMesherTetra::build_internal(
 				normals_w[vertex_count] = gd_normal;
 				colors_w[vertex_count] = params.default_color;
 				uvs_w[vertex_count] = triplanar_uv(*source_positions[corner], warped_normal);
+				if (lod_attribs_w != nullptr) {
+					const size_t li = vertex_count * 4;
+					lod_attribs_w[li] = static_cast<float>(p.x);
+					lod_attribs_w[li + 1] = static_cast<float>(p.y);
+					lod_attribs_w[li + 2] = static_cast<float>(p.z);
+					memcpy(&lod_attribs_w[li + 3], &transition_flags, sizeof(float));
+				}
 				if (tex_attribs_w != nullptr) {
 					// Sampled at the UN-warped position: the warp moves a
 					// vertex up to lattice_warp + patch_relief away, and the
@@ -870,7 +1072,7 @@ void VoxelMesherTetra::build_internal(
 					tangents_w[ti + 2] = static_cast<float>(tangent.z);
 					tangents_w[ti + 3] = tangent_w;
 				}
-				if (input.collision_hint) {
+				if (input.collision_hint && scratch.tri_transition_on[t] == 0) {
 					auto found = collision_vertex_indices.find(emit_keys[corner]);
 					int collision_index;
 					if (found == collision_vertex_indices.end()) {
@@ -897,6 +1099,9 @@ void VoxelMesherTetra::build_internal(
 		out_uvs.resize(vertex_count);
 		if (tangents_w != nullptr) {
 			out_tangents.resize(vertex_count * 4);
+		}
+		if (lod_attribs_w != nullptr) {
+			out_lod_attribs.resize(vertex_count * 4);
 		}
 		if (tex_attribs_w != nullptr) {
 			out_tex_attribs.resize(vertex_count * 2);
@@ -926,6 +1131,10 @@ void VoxelMesherTetra::build_internal(
 	mesh_arrays[Mesh::ARRAY_TEX_UV] = out_uvs;
 	if (params.generate_tangents) {
 		mesh_arrays[Mesh::ARRAY_TANGENT] = out_tangents;
+	}
+	if (input.lod_hint) {
+		mesh_arrays[Mesh::ARRAY_CUSTOM0] = out_lod_attribs;
+		output.mesh_flags |= (RenderingServerEnums::ARRAY_CUSTOM_RGBA_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM0_SHIFT);
 	}
 	if (params.texturing_enabled) {
 		// Two floats per vertex: x = 4 packed indices, y = 4 packed weights.
@@ -1024,6 +1233,15 @@ bool VoxelMesherTetra::get_generate_tangents() const {
 	return _parameters.generate_tangents;
 }
 
+void VoxelMesherTetra::set_lod_transitions_enabled(bool p_enabled) {
+	_parameters.lod_transitions_enabled = p_enabled;
+	emit_changed();
+}
+
+bool VoxelMesherTetra::get_lod_transitions_enabled() const {
+	return _parameters.lod_transitions_enabled;
+}
+
 void VoxelMesherTetra::set_vertex_scale(float p_scale) {
 	_parameters.vertex_scale = MAX(0.0001f, p_scale);
 	emit_changed();
@@ -1116,6 +1334,9 @@ void VoxelMesherTetra::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_generate_tangents", "enabled"), &VoxelMesherTetra::set_generate_tangents);
 	ClassDB::bind_method(D_METHOD("get_generate_tangents"), &VoxelMesherTetra::get_generate_tangents);
+	ClassDB::bind_method(
+			D_METHOD("set_lod_transitions_enabled", "enabled"), &VoxelMesherTetra::set_lod_transitions_enabled);
+	ClassDB::bind_method(D_METHOD("get_lod_transitions_enabled"), &VoxelMesherTetra::get_lod_transitions_enabled);
 
 	ClassDB::bind_method(D_METHOD("set_vertex_scale", "scale"), &VoxelMesherTetra::set_vertex_scale);
 	ClassDB::bind_method(D_METHOD("get_vertex_scale"), &VoxelMesherTetra::get_vertex_scale);
@@ -1156,6 +1377,7 @@ void VoxelMesherTetra::_bind_methods() {
 			PropertyInfo(Variant::BOOL, "texturing_enabled"), "set_texturing_enabled", "get_texturing_enabled");
 	ADD_PROPERTY(
 			PropertyInfo(Variant::BOOL, "generate_tangents"), "set_generate_tangents", "get_generate_tangents");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "lod_transitions_enabled"), "set_lod_transitions_enabled", "get_lod_transitions_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vertex_scale"), "set_vertex_scale", "get_vertex_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "vertex_offset"), "set_vertex_offset", "get_vertex_offset");
 	ADD_GROUP("Collision", "collision_");
