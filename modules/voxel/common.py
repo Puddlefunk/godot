@@ -202,6 +202,7 @@ def get_sources(env, is_editor_build):
             "tests/voxel/test_voxel_graph.cpp",
             "tests/voxel/test_voxel_instancer.cpp",
             "tests/voxel/test_voxel_mesher_cubes.cpp",
+            "tests/voxel/test_voxel_mesher_tetra.cpp",
         ]
 
     if smoosh_meshing_enabled:
@@ -314,4 +315,3 @@ def get_sources(env, is_editor_build):
     sources = process_glob_paths(sources)
 
     return sources
-

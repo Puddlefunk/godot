@@ -1,13 +1,17 @@
 #include "voxel_mesher_tetra.h"
+#include "../../storage/mixel4.h"
 #include "../../storage/voxel_buffer.h"
 #include "../../util/containers/std_unordered_map.h"
 #include "../../util/containers/std_vector.h"
+#include "../../util/godot/classes/array_mesh.h"
+#include "../../util/godot/classes/rendering_server.h"
 #include "../../util/godot/core/class_db.h"
 #include "../../util/godot/core/packed_arrays.h"
 #include "../../util/profiling.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 // Temporary diagnostics: appends one line per build() stage to a fixed path.
 // Remove by setting TETRA_DEBUG_LOG to 0.
@@ -272,13 +276,37 @@ VoxelMesherTetra::VoxelMesherTetra() {
 VoxelMesherTetra::~VoxelMesherTetra() {}
 
 int VoxelMesherTetra::get_used_channels_mask() const {
-	return (1 << VoxelBuffer::CHANNEL_SDF);
+	int mask = (1 << VoxelBuffer::CHANNEL_SDF);
+	if (_parameters.texturing_enabled) {
+		mask |= (1 << VoxelBuffer::CHANNEL_INDICES) | (1 << VoxelBuffer::CHANNEL_WEIGHTS);
+	}
+	return mask;
 }
 
 void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
-	ZN_PROFILE_SCOPE();
+	const Parameters params = _parameters;
+	const int render_subdivisions = CLAMP(params.subdivisions, MIN_SUBDIVISIONS, MAX_SUBDIVISIONS);
+	const int collision_subdivisions = MIN(
+			render_subdivisions, CLAMP(params.collision_subdivisions, MIN_SUBDIVISIONS, MAX_SUBDIVISIONS));
+	if (input.collision_hint && collision_subdivisions != render_subdivisions) {
+		VoxelMesher::Input render_input = input;
+		render_input.collision_hint = false;
+		build_internal(output, render_input, params);
 
-	const Parameters params = _parameters; // Local copy: build() runs on multiple threads.
+		Parameters collision_params = params;
+		collision_params.subdivisions = collision_subdivisions;
+		VoxelMesher::Output collision_output;
+		build_internal(collision_output, input, collision_params);
+		output.collision_surface.positions.swap(collision_output.collision_surface.positions);
+		output.collision_surface.indices.swap(collision_output.collision_surface.indices);
+		return;
+	}
+	build_internal(output, input, params);
+}
+
+void VoxelMesherTetra::build_internal(
+		VoxelMesher::Output &output, const VoxelMesher::Input &input, const Parameters &params) {
+	ZN_PROFILE_SCOPE();
 
 	const VoxelBuffer &voxels = input.voxels;
 	const Vector3i buffer_size = voxels.get_size();
@@ -300,7 +328,11 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 	}
 
 	const int r = CLAMP(params.subdivisions, MIN_SUBDIVISIONS, MAX_SUBDIVISIONS);
+	const int lod_stride = 1 << input.lod_index;
 	const double step = 1.0 / static_cast<double>(r);
+	const double world_step = static_cast<double>(lod_stride) * step;
+	const Vector3i content_origin = input.origin_in_voxels;
+	const Vector3i padded_origin = content_origin - Vector3iUtil::create(min_pad * lod_stride);
 
 	// -----------------------------------------------------------------------
 	// Read all SDF samples once, then build the density lattice. Density uses
@@ -398,14 +430,12 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 			MIN(emit_max.y + 1, lattice_points.y - 1),
 			MIN(emit_max.z + 1, lattice_points.z - 1));
 
-	// Global lattice ids: 21 bits per axis, offset to keep them positive.
-	// Buffer index 0 corresponds to global voxel coordinate origin_in_voxels.
+	// Global lattice ids use units of 1/subdivisions at LOD0.
 	const int64_t axis_bias = int64_t(1) << 20;
-	const Vector3i origin = input.origin_in_voxels;
 	const auto global_lattice_id = [&](int lx, int ly, int lz) -> uint64_t {
-		const int64_t gx = static_cast<int64_t>(origin.x) * r + lx + axis_bias;
-		const int64_t gy = static_cast<int64_t>(origin.y) * r + ly + axis_bias;
-		const int64_t gz = static_cast<int64_t>(origin.z) * r + lz + axis_bias;
+		const int64_t gx = static_cast<int64_t>(padded_origin.x) * r + static_cast<int64_t>(lx) * lod_stride + axis_bias;
+		const int64_t gy = static_cast<int64_t>(padded_origin.y) * r + static_cast<int64_t>(ly) * lod_stride + axis_bias;
+		const int64_t gz = static_cast<int64_t>(padded_origin.z) * r + static_cast<int64_t>(lz) * lod_stride + axis_bias;
 		// 21+21+21 bits; unique within a ~2-million-lattice-cell span per axis,
 		// and consistent across neighboring blocks, which is what welding and
 		// seam determinism require.
@@ -413,7 +443,7 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 				static_cast<uint64_t>(gz & 0x1fffff);
 	};
 
-	const double area_epsilon = 1.0e-8 * step * step * step * step;
+	const double area_epsilon = 1.0e-8 * world_step * world_step * world_step * world_step;
 
 	{
 		ZN_PROFILE_SCOPE_NAMED("March");
@@ -479,18 +509,15 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 					const bool emit = cx >= emit_min && cy >= emit_min && cz >= emit_min && cx < emit_max.x &&
 							cy < emit_max.y && cz < emit_max.z;
 
-					// Corner positions in GLOBAL voxel units. Buffer lattice
-					// point l maps to voxel coordinate origin + l/r - min_pad
-					// is NOT applied here: origin corresponds to buffer index
-					// 0 (padding included), so it is simply origin + l/r.
+					// Corner positions in LOD0 world-voxel units.
 					for (int ci = 0; ci < 8; ++ci) {
 						const int lx = cx + CUBE_CORNERS[ci][0];
 						const int ly = cy + CUBE_CORNERS[ci][1];
 						const int lz = cz + CUBE_CORNERS[ci][2];
 						corner_positions[ci] = DVec3(
-								static_cast<double>(origin.x) + lx * step,
-								static_cast<double>(origin.y) + ly * step,
-								static_cast<double>(origin.z) + lz * step);
+								static_cast<double>(padded_origin.x) + lx * world_step,
+								static_cast<double>(padded_origin.y) + ly * world_step,
+								static_cast<double>(padded_origin.z) + lz * world_step);
 					}
 
 					for (int ti = 0; ti < 6; ++ti) {
@@ -633,6 +660,8 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 	PackedColorArray out_colors;
 	PackedVector2Array out_uvs;
 	PackedFloat32Array out_tangents;
+	PackedFloat32Array out_tex_attribs;
+	StdUnorderedMap<uint64_t, int> collision_vertex_indices;
 
 	{
 		ZN_PROFILE_SCOPE_NAMED("Emit");
@@ -642,9 +671,9 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 		// (identity by default; used by callers that bake voxel size and a
 		// recentering offset directly into the mesh).
 		const DVec3 local_offset(
-				static_cast<double>(origin.x) + min_pad,
-				static_cast<double>(origin.y) + min_pad,
-				static_cast<double>(origin.z) + min_pad);
+				static_cast<double>(content_origin.x),
+				static_cast<double>(content_origin.y),
+				static_cast<double>(content_origin.z));
 		const double v_scale = params.vertex_scale;
 		const DVec3 v_offset(params.vertex_offset.x, params.vertex_offset.y, params.vertex_offset.z);
 
@@ -672,6 +701,46 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 			return Vector2(p.x, p.y) * params.uv_scale;
 		};
 
+		// Voxel material for one surface vertex, packed the way the rest of
+		// the module expects to read it.
+		//
+		// The vertex sits ON the isosurface, so the voxel it falls in is as
+		// likely to be air as ground -- and an air voxel's material is
+		// whatever the generator happened to leave there. Stepping half a
+		// voxel back along the surface normal lands on the solid side every
+		// time, which is the sample that actually means something.
+		//
+		const auto sample_tex_attrib = [&](const DVec3 &surface_pos, const DVec3 &normal, float &out_indices_f,
+										   float &out_weights_f) {
+			const DVec3 inside = surface_pos - normal * (0.5 * lod_stride);
+			const double inv_stride = 1.0 / static_cast<double>(lod_stride);
+			const int bx = CLAMP(static_cast<int>(std::floor((inside.x - padded_origin.x) * inv_stride + 0.5)), 0,
+					buffer_size.x - 1);
+			const int by = CLAMP(static_cast<int>(std::floor((inside.y - padded_origin.y) * inv_stride + 0.5)), 0,
+					buffer_size.y - 1);
+			const int bz = CLAMP(static_cast<int>(std::floor((inside.z - padded_origin.z) * inv_stride + 0.5)), 0,
+					buffer_size.z - 1);
+
+			// 4x4-bit in the buffer, 4x8-bit in the mesh. Both defaults are
+			// sane on an untouched buffer -- indices (0,1,2,3), weights
+			// (255,0,0,0) -- so a generator that writes no material at all
+			// still produces a valid "all texture 0" attribute rather than
+			// four zero weights the shader would have to divide by.
+			const uint16_t packed_indices_u16 =
+					static_cast<uint16_t>(voxels.get_voxel(bx, by, bz, VoxelBuffer::CHANNEL_INDICES));
+			const uint16_t packed_weights_u16 =
+					static_cast<uint16_t>(voxels.get_voxel(bx, by, bz, VoxelBuffer::CHANNEL_WEIGHTS));
+			const FixedArray<uint8_t, 4> ind = mixel4::decode_indices_from_packed_u16(packed_indices_u16);
+			const FixedArray<uint8_t, 4> wei = mixel4::decode_weights_from_packed_u16(packed_weights_u16);
+
+			const uint32_t pi = static_cast<uint32_t>(ind[0]) | (static_cast<uint32_t>(ind[1]) << 8) |
+					(static_cast<uint32_t>(ind[2]) << 16) | (static_cast<uint32_t>(ind[3]) << 24);
+			const uint32_t pw = static_cast<uint32_t>(wei[0]) | (static_cast<uint32_t>(wei[1]) << 8) |
+					(static_cast<uint32_t>(wei[2]) << 16) | (static_cast<uint32_t>(wei[3]) << 24);
+			memcpy(&out_indices_f, &pi, sizeof(float));
+			memcpy(&out_weights_f, &pw, sizeof(float));
+		};
+
 		const size_t max_vertices = triangle_count * 3;
 		out_vertices.resize(max_vertices);
 		out_normals.resize(max_vertices);
@@ -680,12 +749,19 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 		if (params.generate_tangents) {
 			out_tangents.resize(max_vertices * 4);
 		}
+		if (params.texturing_enabled) {
+			out_tex_attribs.resize(max_vertices * 2);
+		}
+		float *tex_attribs_w = params.texturing_enabled ? out_tex_attribs.ptrw() : nullptr;
 		Vector3 *vertices_w = out_vertices.ptrw();
 		Vector3 *normals_w = out_normals.ptrw();
 		Color *colors_w = out_colors.ptrw();
 		Vector2 *uvs_w = out_uvs.ptrw();
 		float *tangents_w = params.generate_tangents ? out_tangents.ptrw() : nullptr;
 		size_t vertex_count = 0;
+		if (input.collision_hint) {
+			collision_vertex_indices.reserve(max_vertices / 3);
+		}
 
 		for (size_t t = 0; t < triangle_count; ++t) {
 			if (scratch.tri_emit[t] == 0) {
@@ -705,6 +781,9 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 			DVec3 warped_a = warped_of(a, scratch.tri_keys[i]) - local_offset;
 			DVec3 warped_b = warped_of(b, scratch.tri_keys[i + 1]) - local_offset;
 			DVec3 warped_c = warped_of(c, scratch.tri_keys[i + 2]) - local_offset;
+			uint64_t key_a = scratch.tri_keys[i];
+			uint64_t key_b = scratch.tri_keys[i + 1];
+			uint64_t key_c = scratch.tri_keys[i + 2];
 
 			DVec3 warped_normal = (warped_b - warped_a).cross(warped_c - warped_a);
 			if (warped_normal.length_squared() < area_epsilon) {
@@ -719,6 +798,9 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 				const DVec3 swapped_source = b;
 				b = c;
 				c = swapped_source;
+				const uint64_t swapped_key = key_b;
+				key_b = key_c;
+				key_c = swapped_key;
 				warped_normal = warped_normal * -1.0;
 			}
 
@@ -764,6 +846,7 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 			// on the way out. The normal stays outward regardless.
 			const DVec3 *emit_positions[3] = { &warped_a, &warped_c, &warped_b };
 			const DVec3 *source_positions[3] = { &a, &c, &b };
+			const uint64_t emit_keys[3] = { key_a, key_c, key_b };
 			for (int corner = 0; corner < 3; ++corner) {
 				const DVec3 p = (*emit_positions[corner]) * v_scale + v_offset;
 				vertices_w[vertex_count] = Vector3(
@@ -771,12 +854,33 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 				normals_w[vertex_count] = gd_normal;
 				colors_w[vertex_count] = params.default_color;
 				uvs_w[vertex_count] = triplanar_uv(*source_positions[corner], warped_normal);
+				if (tex_attribs_w != nullptr) {
+					// Sampled at the UN-warped position: the warp moves a
+					// vertex up to lattice_warp + patch_relief away, and the
+					// material belongs to where the surface mathematically is,
+					// not to where the stylization pushed it.
+					const size_t xi = vertex_count * 2;
+					sample_tex_attrib(
+							*source_positions[corner], warped_normal, tex_attribs_w[xi], tex_attribs_w[xi + 1]);
+				}
 				if (tangents_w != nullptr) {
 					const size_t ti = vertex_count * 4;
 					tangents_w[ti] = static_cast<float>(tangent.x);
 					tangents_w[ti + 1] = static_cast<float>(tangent.y);
 					tangents_w[ti + 2] = static_cast<float>(tangent.z);
 					tangents_w[ti + 3] = tangent_w;
+				}
+				if (input.collision_hint) {
+					auto found = collision_vertex_indices.find(emit_keys[corner]);
+					int collision_index;
+					if (found == collision_vertex_indices.end()) {
+						collision_index = output.collision_surface.positions.size();
+						collision_vertex_indices.insert({ emit_keys[corner], collision_index });
+						output.collision_surface.positions.push_back(Vector3f(p.x, p.y, p.z));
+					} else {
+						collision_index = found->second;
+					}
+					output.collision_surface.indices.push_back(collision_index);
 				}
 				++vertex_count;
 			}
@@ -793,6 +897,9 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 		out_uvs.resize(vertex_count);
 		if (tangents_w != nullptr) {
 			out_tangents.resize(vertex_count * 4);
+		}
+		if (tex_attribs_w != nullptr) {
+			out_tex_attribs.resize(vertex_count * 2);
 		}
 	}
 
@@ -819,6 +926,14 @@ void VoxelMesherTetra::build(VoxelMesher::Output &output, const VoxelMesher::Inp
 	mesh_arrays[Mesh::ARRAY_TEX_UV] = out_uvs;
 	if (params.generate_tangents) {
 		mesh_arrays[Mesh::ARRAY_TANGENT] = out_tangents;
+	}
+	if (params.texturing_enabled) {
+		// Two floats per vertex: x = 4 packed indices, y = 4 packed weights.
+		// The format flag is not optional -- without it the RenderingServer
+		// reads CUSTOM1 as the default (8-bit unorm) and every index comes
+		// back as a fraction.
+		mesh_arrays[Mesh::ARRAY_CUSTOM1] = out_tex_attribs;
+		output.mesh_flags |= (RenderingServerEnums::ARRAY_CUSTOM_RG_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM1_SHIFT);
 	}
 	mesh_arrays[Mesh::ARRAY_INDEX] = out_indices;
 	output.surfaces.push_back(surface);
@@ -891,6 +1006,15 @@ Color VoxelMesherTetra::get_default_color() const {
 	return _parameters.default_color;
 }
 
+void VoxelMesherTetra::set_texturing_enabled(bool p_enabled) {
+	_parameters.texturing_enabled = p_enabled;
+	emit_changed();
+}
+
+bool VoxelMesherTetra::get_texturing_enabled() const {
+	return _parameters.texturing_enabled;
+}
+
 void VoxelMesherTetra::set_generate_tangents(bool p_enabled) {
 	_parameters.generate_tangents = p_enabled;
 	emit_changed();
@@ -914,8 +1038,42 @@ void VoxelMesherTetra::set_vertex_offset(Vector3 p_offset) {
 	emit_changed();
 }
 
+Vector3 VoxelMesherTetra::stylize_world_point(
+		Vector3 p_world_position, Vector3 p_world_normal, float p_voxel_size) const {
+	if (!_parameters.warp_enabled || p_voxel_size <= 0.f) {
+		return p_world_position;
+	}
+	const double vs = static_cast<double>(p_voxel_size);
+	const DVec3 p(static_cast<double>(p_world_position.x) / vs, static_cast<double>(p_world_position.y) / vs,
+			static_cast<double>(p_world_position.z) / vs);
+
+	// The relief term is the only consumer of the normal, and it is skipped
+	// entirely when patch_relief is 0 -- but a caller that passes a degenerate
+	// normal should get the warp rather than a NaN.
+	DVec3 n(static_cast<double>(p_world_normal.x), static_cast<double>(p_world_normal.y),
+			static_cast<double>(p_world_normal.z));
+	if (n.length_squared() < 1.0e-12) {
+		n = DVec3(0.0, 1.0, 0.0);
+	} else {
+		n = n.normalized();
+	}
+
+	const DVec3 w = stylized_surface_position(p, n, _parameters.lattice_warp, _parameters.patch_relief,
+			_parameters.patch_size, _parameters.patch_relief_smoothing);
+	return Vector3(static_cast<real_t>(w.x * vs), static_cast<real_t>(w.y * vs), static_cast<real_t>(w.z * vs));
+}
+
 Vector3 VoxelMesherTetra::get_vertex_offset() const {
 	return _parameters.vertex_offset;
+}
+
+void VoxelMesherTetra::set_collision_subdivisions(int p_subdivisions) {
+	_parameters.collision_subdivisions = CLAMP(p_subdivisions, MIN_SUBDIVISIONS, MAX_SUBDIVISIONS);
+	emit_changed();
+}
+
+int VoxelMesherTetra::get_collision_subdivisions() const {
+	return _parameters.collision_subdivisions;
 }
 
 void VoxelMesherTetra::set_uv_scale(float p_scale) {
@@ -928,6 +1086,9 @@ float VoxelMesherTetra::get_uv_scale() const {
 }
 
 void VoxelMesherTetra::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("stylize_world_point", "world_position", "world_normal", "voxel_size"),
+			&VoxelMesherTetra::stylize_world_point);
+
 	ClassDB::bind_method(D_METHOD("set_subdivisions", "subdivisions"), &VoxelMesherTetra::set_subdivisions);
 	ClassDB::bind_method(D_METHOD("get_subdivisions"), &VoxelMesherTetra::get_subdivisions);
 
@@ -950,6 +1111,9 @@ void VoxelMesherTetra::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_default_color", "color"), &VoxelMesherTetra::set_default_color);
 	ClassDB::bind_method(D_METHOD("get_default_color"), &VoxelMesherTetra::get_default_color);
 
+	ClassDB::bind_method(D_METHOD("set_texturing_enabled", "enabled"), &VoxelMesherTetra::set_texturing_enabled);
+	ClassDB::bind_method(D_METHOD("get_texturing_enabled"), &VoxelMesherTetra::get_texturing_enabled);
+
 	ClassDB::bind_method(D_METHOD("set_generate_tangents", "enabled"), &VoxelMesherTetra::set_generate_tangents);
 	ClassDB::bind_method(D_METHOD("get_generate_tangents"), &VoxelMesherTetra::get_generate_tangents);
 
@@ -958,6 +1122,10 @@ void VoxelMesherTetra::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_vertex_offset", "offset"), &VoxelMesherTetra::set_vertex_offset);
 	ClassDB::bind_method(D_METHOD("get_vertex_offset"), &VoxelMesherTetra::get_vertex_offset);
+
+	ClassDB::bind_method(
+			D_METHOD("set_collision_subdivisions", "subdivisions"), &VoxelMesherTetra::set_collision_subdivisions);
+	ClassDB::bind_method(D_METHOD("get_collision_subdivisions"), &VoxelMesherTetra::get_collision_subdivisions);
 
 	ClassDB::bind_method(D_METHOD("set_uv_scale", "scale"), &VoxelMesherTetra::set_uv_scale);
 	ClassDB::bind_method(D_METHOD("get_uv_scale"), &VoxelMesherTetra::get_uv_scale);
@@ -985,9 +1153,15 @@ void VoxelMesherTetra::_bind_methods() {
 			"get_patch_relief_smoothing");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "default_color"), "set_default_color", "get_default_color");
 	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "texturing_enabled"), "set_texturing_enabled", "get_texturing_enabled");
+	ADD_PROPERTY(
 			PropertyInfo(Variant::BOOL, "generate_tangents"), "set_generate_tangents", "get_generate_tangents");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vertex_scale"), "set_vertex_scale", "get_vertex_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "vertex_offset"), "set_vertex_offset", "get_vertex_offset");
+	ADD_GROUP("Collision", "collision_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_subdivisions", PROPERTY_HINT_RANGE, "1,4,1"),
+			"set_collision_subdivisions", "get_collision_subdivisions");
+	ADD_GROUP("", "");
 	ADD_PROPERTY(
 			PropertyInfo(Variant::FLOAT, "uv_scale", PROPERTY_HINT_RANGE, "0.0,16.0,0.01"),
 			"set_uv_scale",

@@ -192,6 +192,12 @@ public:
 		// Total time spent in the last update task, in microseconds.
 		// This only includes the threadable part, not the whole `process` function.
 		uint32_t time_update_task = 0;
+		uint64_t applied_mesh_updates = 0;
+		uint64_t time_apply_mesh_updates = 0;
+		uint32_t time_apply_mesh_update_max = 0;
+		uint64_t applied_collision_updates = 0;
+		uint64_t time_apply_collision_updates = 0;
+		uint32_t time_apply_collision_update_max = 0;
 	};
 
 	const Stats &get_stats() const;

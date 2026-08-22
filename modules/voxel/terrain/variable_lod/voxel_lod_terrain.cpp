@@ -116,7 +116,12 @@ void VoxelLodTerrain::ApplyMeshUpdateTask::run(TimeSpreadTaskContext &ctx) {
 		queued_tasks_in_lod.erase(it);
 	}
 
+	const uint64_t time_before = Time::get_singleton()->get_ticks_usec();
 	self->apply_mesh_update(data);
+	const uint64_t elapsed = Time::get_singleton()->get_ticks_usec() - time_before;
+	++self->_stats.applied_mesh_updates;
+	self->_stats.time_apply_mesh_updates += elapsed;
+	self->_stats.time_apply_mesh_update_max = math::max(self->_stats.time_apply_mesh_update_max, uint32_t(elapsed));
 }
 
 VoxelLodTerrain::VoxelLodTerrain() {
@@ -2102,10 +2107,16 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 
 		if (_collision_update_delay == 0 ||
 			static_cast<int>(now - block->last_collider_update_time) > _collision_update_delay) {
+			const uint64_t time_before = Time::get_singleton()->get_ticks_usec();
 			ZN_ASSERT(_mesher.is_valid());
 			Ref<Shape3D> collision_shape = make_collision_shape_from_mesher_output(ob.surfaces, **_mesher);
 			set_block_collision_shape(*this, *block, collision_shape, now);
 			block->set_collision_enabled(collision_active);
+			const uint64_t elapsed = Time::get_singleton()->get_ticks_usec() - time_before;
+			++_stats.applied_collision_updates;
+			_stats.time_apply_collision_updates += elapsed;
+			_stats.time_apply_collision_update_max =
+					math::max(_stats.time_apply_collision_update_max, uint32_t(elapsed));
 
 		} else {
 			if (block->deferred_collider_data == nullptr) {
@@ -2633,6 +2644,12 @@ Dictionary VoxelLodTerrain::_b_get_statistics() const {
 	d["time_mesh_requests"] = _stats.time_mesh_requests;
 	d["time_update_task"] = _stats.time_update_task;
 	d["blocked_lods"] = _stats.blocked_lods;
+	d["applied_mesh_updates"] = _stats.applied_mesh_updates;
+	d["time_apply_mesh_updates"] = _stats.time_apply_mesh_updates;
+	d["time_apply_mesh_update_max"] = _stats.time_apply_mesh_update_max;
+	d["applied_collision_updates"] = _stats.applied_collision_updates;
+	d["time_apply_collision_updates"] = _stats.time_apply_collision_updates;
+	d["time_apply_collision_update_max"] = _stats.time_apply_collision_update_max;
 
 	// Process
 	d["dropped_block_loads"] = _stats.dropped_block_loads;

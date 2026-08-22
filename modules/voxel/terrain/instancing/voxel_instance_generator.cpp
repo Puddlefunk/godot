@@ -302,6 +302,69 @@ inline bool triangle_contains_enough_material_interpolated(
 	return false;
 }
 
+// The strongest weight among the materials the mask selects, UN-normalized.
+//
+// The boolean tests above answer "is this material present enough"; these two
+// answer "how much of it is there", which is what a density ramp needs. Kept
+// separate rather than folded in, because the magnitude is only meaningful when
+// the generator writing the voxels put something in it deliberately -- see
+// set_voxel_material_filter_falloff().
+inline float vertex_material_weight(const TexAttrib attrib, const uint32_t material_mask) {
+	unsigned int best = 0;
+	for (unsigned int i = 0; i < 4; ++i) {
+		const uint32_t vmat_index = (attrib.packed_indices >> (i * 8)) & 0xff;
+		if (((1 << vmat_index) & material_mask) != 0) {
+			const unsigned int w = (attrib.packed_weights >> (i * 8)) & 0xff;
+			if (w > best) {
+				best = w;
+			}
+		}
+	}
+	return u8_to_unorm(best);
+}
+
+// Same, interpolated across a triangle.
+//
+// Deliberately does NOT call linear_normalize(), unlike its boolean twin above.
+// Normalizing divides the magnitude back out, and the magnitude is the whole
+// signal here.
+inline float triangle_material_weight(
+		const Span<const TexAttrib> attrib_array,
+		const Span<const int32_t> mesh_indices,
+		const Span<const float> barycentrics,
+		const unsigned int instance_index,
+		const unsigned int ii0,
+		const uint32_t material_mask
+) {
+	const uint32_t vi0 = mesh_indices[ii0 + 0];
+	const uint32_t vi1 = mesh_indices[ii0 + 1];
+	const uint32_t vi2 = mesh_indices[ii0 + 2];
+
+	const uint32_t packed_indices = attrib_array[vi0].packed_indices;
+
+	const Vector4f rweights0 = unpack_weights(attrib_array[vi0].packed_weights);
+	const Vector4f rweights1 = unpack_weights(attrib_array[vi1].packed_weights);
+	const Vector4f rweights2 = unpack_weights(attrib_array[vi2].packed_weights);
+
+	const Vector3f bary(
+			barycentrics[instance_index * 3 + 0],
+			barycentrics[instance_index * 3 + 1],
+			barycentrics[instance_index * 3 + 2]
+	);
+
+	float best = 0.f;
+	for (unsigned int i = 0; i < 4; ++i) {
+		const uint32_t vmat_index = (packed_indices >> (i * 8)) & 0xff;
+		if (((1 << vmat_index) & material_mask) != 0) {
+			const float weight = math::interpolate_triangle(rweights0[i], rweights1[i], rweights2[i], bary);
+			if (weight > best) {
+				best = weight;
+			}
+		}
+	}
+	return best;
+}
+
 // Filter out by voxel materials
 // Assuming 4x8-bit weights and 4x8-bit indices as used in VoxelMesherTransvoxel for now, but might have other
 // formats in the future
@@ -318,10 +381,26 @@ void filter_instances_by_voxel_materials(
 		Span<const int32_t> mesh_indices,
 		Span<const TexAttrib> mesh_tex_attrib_array,
 		const float weight_threshold,
+		// 0 = the original hard in/out test. Above 0, density ramps with the
+		// material weight instead of switching on it. See
+		// set_voxel_material_filter_falloff().
+		const float weight_falloff,
+		RandomPCG &pcg,
 		const uint32_t material_mask,
 		const VoxelInstanceGenerator::EmitMode emit_mode
 ) {
 	ZN_PROFILE_SCOPE();
+
+	// Probability of keeping an instance whose material weight is `w`. Squared,
+	// and drawn against, exactly like the noise filter further down this file --
+	// same curve, so the two fields compose predictably when both are in use.
+	const auto keep = [&pcg, weight_threshold, weight_falloff](const float w) -> bool {
+		const float d = (w - weight_threshold) / weight_falloff;
+		if (d < 0.f) {
+			return false;
+		}
+		return pcg.randf() <= d * d;
+	};
 
 	switch (emit_mode) {
 		case VoxelInstanceGenerator::EMIT_FROM_VERTICES: {
@@ -331,7 +410,10 @@ void filter_instances_by_voxel_materials(
 			for (unsigned int instance_index = 0; instance_index < instance_positions.size();) {
 				const unsigned int vi = instance_indices[instance_index];
 				const TexAttrib attrib = mesh_tex_attrib_array[vi];
-				if (vertex_contains_enough_material(attrib, weight_threshold_i, material_mask)) {
+				const bool kept = weight_falloff > 0.f
+						? keep(vertex_material_weight(attrib, material_mask))
+						: vertex_contains_enough_material(attrib, weight_threshold_i, material_mask);
+				if (kept) {
 					instance_index += 1;
 				} else {
 					// Remove instance
@@ -354,16 +436,21 @@ void filter_instances_by_voxel_materials(
 			const Span<const float> barycentrics_s = to_span(instance_barycentrics);
 			for (unsigned int instance_index = 0; instance_index < instance_positions.size();) {
 				const uint32_t ii0 = instance_indices[instance_index];
-				// if (L::triangle_contains_enough_material_rough(
-				if (triangle_contains_enough_material_interpolated(
-							mesh_tex_attrib_array,
-							mesh_indices,
-							barycentrics_s,
-							instance_index,
-							ii0,
-							weight_threshold,
-							material_mask
-					)) {
+				const bool kept = weight_falloff > 0.f
+						? keep(triangle_material_weight(
+								  mesh_tex_attrib_array, mesh_indices, barycentrics_s, instance_index, ii0,
+								  material_mask
+						  ))
+						: triangle_contains_enough_material_interpolated(
+								  mesh_tex_attrib_array,
+								  mesh_indices,
+								  barycentrics_s,
+								  instance_index,
+								  ii0,
+								  weight_threshold,
+								  material_mask
+						  );
+				if (kept) {
 					instance_index += 1;
 				} else {
 					// Remove instance
@@ -1131,6 +1218,8 @@ void VoxelInstanceGenerator::generate_transforms(
 				mesh.indices,
 				mesh.texture_data,
 				_voxel_material_filter_threshold,
+				_voxel_material_filter_falloff,
+				pcg1,
 				_voxel_material_filter_mask,
 				_emit_mode
 		);
@@ -1850,6 +1939,19 @@ float VoxelInstanceGenerator::get_voxel_material_filter_threshold() const {
 	return _voxel_material_filter_threshold;
 }
 
+void VoxelInstanceGenerator::set_voxel_material_filter_falloff(const float p_falloff) {
+	const float falloff = math::max(p_falloff, 0.f);
+	if (falloff == _voxel_material_filter_falloff) {
+		return;
+	}
+	_voxel_material_filter_falloff = falloff;
+	emit_changed();
+}
+
+float VoxelInstanceGenerator::get_voxel_material_filter_falloff() const {
+	return _voxel_material_filter_falloff;
+}
+
 void VoxelInstanceGenerator::set_snap_to_generator_sdf_enabled(bool enabled) {
 	if (_gen_sdf_snap_settings.enabled == enabled) {
 		return;
@@ -2092,6 +2194,11 @@ void VoxelInstanceGenerator::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_voxel_texture_filter_threshold"), &Self::get_voxel_material_filter_threshold);
 
 	ClassDB::bind_method(
+			D_METHOD("set_voxel_texture_filter_falloff", "falloff"), &Self::set_voxel_material_filter_falloff
+	);
+	ClassDB::bind_method(D_METHOD("get_voxel_texture_filter_falloff"), &Self::get_voxel_material_filter_falloff);
+
+	ClassDB::bind_method(
 			D_METHOD("set_voxel_texture_filter_array", "texture_indices"), &Self::_b_set_voxel_material_filter_array
 	);
 	ClassDB::bind_method(D_METHOD("get_voxel_texture_filter_array"), &Self::_b_get_voxel_material_filter_array);
@@ -2255,6 +2362,11 @@ void VoxelInstanceGenerator::_bind_methods() {
 			PropertyInfo(Variant::BOOL, "voxel_texture_filter_enabled"),
 			"set_voxel_texture_filter_enabled",
 			"is_voxel_texture_filter_enabled"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "voxel_texture_filter_falloff", PROPERTY_HINT_RANGE, "0.0,1.0,0.001"),
+			"set_voxel_texture_filter_falloff",
+			"get_voxel_texture_filter_falloff"
 	);
 	// ADD_PROPERTY(
 	// 		PropertyInfo(Variant::INT, "voxel_texture_filter_mask"),

@@ -26,8 +26,7 @@ namespace zylann::voxel {
 // uniform vertex color and triplanar UVs derived from the un-warped surface
 // position, matching the source implementation.
 //
-// LOD is not supported yet (no transition cells, and the stylization fields do
-// not currently rescale across LODs) — use with VoxelTerrain.
+// LOD sampling is supported. Coarse/fine transition cells are not emitted yet.
 class VoxelMesherTetra : public VoxelMesher {
 	GDCLASS(VoxelMesherTetra, VoxelMesher)
 
@@ -78,6 +77,24 @@ public:
 	void set_uv_scale(float p_scale);
 	float get_uv_scale() const;
 
+	// Carry voxel material through to the mesh, in the format the rest of the
+	// module already speaks: CHANNEL_INDICES / CHANNEL_WEIGHTS are read at the
+	// solid side of each surface vertex and written to ARRAY_CUSTOM1 as
+	// ARRAY_CUSTOM_RG_FLOAT -- x holds four 8-bit indices, y four 8-bit
+	// weights, exactly as VoxelMesherTransvoxel packs them.
+	//
+	// That one format choice buys two consumers, not one. A shader can blend
+	// four surfaces per vertex (see doc/source/smooth_terrain.md), and
+	// VoxelInstanceGenerator's voxel_material_filter reads the same attribute
+	// off ARRAY_CUSTOM1 to decide where a scatter item is allowed to grow --
+	// so per-biome foliage falls out of it with no further engine work.
+	//
+	// Off by default: it costs two channel reads per emitted vertex plus the
+	// extra vertex attribute, and a generator that writes no material channels
+	// would only produce index 0 everywhere.
+	void set_texturing_enabled(bool p_enabled);
+	bool get_texturing_enabled() const;
+
 	// Emit ARRAY_TANGENT (per-triangle tangent from the flat normal, binormal
 	// sign +1). Required for normal-mapped PBR materials.
 	void set_generate_tangents(bool p_enabled);
@@ -91,10 +108,37 @@ public:
 	void set_vertex_offset(Vector3 p_offset);
 	Vector3 get_vertex_offset() const;
 
+	void set_collision_subdivisions(int p_subdivisions);
+	int get_collision_subdivisions() const;
+
+	// Where a point on the ANALYTIC isosurface ends up on the VISIBLE one.
+	//
+	// build() displaces every vertex through stylized_surface_position AFTER
+	// the SDF has been sampled, so anything placed by tracing the SDF -- props,
+	// scatter, traversal seats -- sits on a surface that is up to
+	// lattice_warp (x0.45 on Y) plus patch_relief away from the one the player
+	// sees. terrain_sense.gd's header called that "usually invisible"; it is
+	// not, for anything with a hard base edge sitting flush on the ground.
+	//
+	// This is a BINDING, not a second implementation: it calls the same
+	// function build() calls, with this mesher's own live parameters, so the
+	// two cannot drift. Configure a mesher exactly as the build did (same
+	// warp_enabled / lattice_warp / patch_relief / patch_size / smoothing) and
+	// the answer is exact.
+	//
+	// Takes and returns WORLD units; the transform itself works in global voxel
+	// units, hence voxel_size. Returns the input unchanged when warp_enabled is
+	// false or voxel_size is non-positive, so callers need no special case.
+	Vector3 stylize_world_point(Vector3 p_world_position, Vector3 p_world_normal, float p_voxel_size) const;
+
 	int get_used_channels_mask() const override;
 
 	bool supports_lod() const override {
-		return false;
+		return true;
+	}
+
+	bool is_generating_collision_surface() const override {
+		return true;
 	}
 
 protected:
@@ -113,9 +157,13 @@ private:
 		Color default_color = Color(1, 1, 1, 1);
 		float uv_scale = 0.35f;
 		bool generate_tangents = false;
+		bool texturing_enabled = false;
 		float vertex_scale = 1.f;
 		Vector3 vertex_offset;
+		int collision_subdivisions = 1;
 	};
+
+	void build_internal(VoxelMesher::Output &output, const VoxelMesher::Input &input, const Parameters &params);
 
 	Parameters _parameters;
 };

@@ -26,6 +26,7 @@
 #include "voxel/test_voxel_graph.h"
 #include "voxel/test_voxel_instancer.h"
 #include "voxel/test_voxel_mesher_cubes.h"
+#include "voxel/test_voxel_mesher_tetra.h"
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 #include "voxel/test_transvoxel.h"
@@ -134,6 +135,10 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_flat_map);
 	VOXEL_TEST(test_expression_parser);
 	VOXEL_TEST(test_voxel_mesher_cubes);
+	VOXEL_TEST(test_voxel_mesher_tetra_lod_coordinates);
+	VOXEL_TEST(test_voxel_mesher_tetra_same_lod_border);
+	VOXEL_TEST(test_voxel_mesher_tetra_collision_surface);
+	VOXEL_TEST(test_voxel_mesher_tetra_collision_border);
 	VOXEL_TEST(test_threaded_task_runner_misc);
 	VOXEL_TEST(test_threaded_task_runner_debug_names);
 	VOXEL_TEST(test_task_priority_values);

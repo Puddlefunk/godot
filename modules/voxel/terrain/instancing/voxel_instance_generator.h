@@ -158,6 +158,25 @@ public:
 	void set_voxel_material_filter_threshold(const float p_threshold);
 	float get_voxel_material_filter_threshold() const;
 
+	// Turns the voxel material filter from a SWITCH into a RAMP.
+	//
+	// At 0 (the default) behaviour is unchanged: an instance survives if the
+	// filtered material's weight clears the threshold, and dies otherwise. That
+	// is a step function in space, and it is why a constant density has always
+	// produced a uniform carpet wherever it produced anything at all.
+	//
+	// Above 0, an instance is kept with probability ((w - threshold)/falloff)^2,
+	// drawn per instance -- the same curve the noise filter in this file already
+	// uses, so the two compose predictably. Density then FOLLOWS whatever field
+	// the generator wrote into the material weights, which is how a hand-rolled
+	// scatter gets its natural look: `expected = density * area * weight`.
+	//
+	// Requires the generator to have written something meaningful into the
+	// weight MAGNITUDE rather than just its ratios. Weights that always sum to 1
+	// carry no magnitude and this will behave like a slightly noisy switch.
+	void set_voxel_material_filter_falloff(const float p_falloff);
+	float get_voxel_material_filter_falloff() const;
+
 	void set_snap_to_generator_sdf_enabled(bool enabled);
 	bool get_snap_to_generator_sdf_enabled() const;
 
@@ -217,6 +236,7 @@ private:
 	bool _voxel_material_filter_enabled = false;
 	uint32_t _voxel_material_filter_mask = 1;
 	float _voxel_material_filter_threshold = 0.5f;
+	float _voxel_material_filter_falloff = 0.f;
 
 	struct GeneratorSDFSnapSettings {
 		bool enabled = false;
