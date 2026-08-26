@@ -157,6 +157,16 @@ public:
 
 	void set_lod_fade_duration(float seconds);
 	float get_lod_fade_duration() const;
+	void set_lod_fade_travel_distance(float distance);
+	float get_lod_fade_travel_distance() const;
+	void set_lod_geomorph_debug_weight(float weight);
+	float get_lod_geomorph_debug_weight() const;
+	void set_lod_geomorph_debug_lod(int lod_index);
+	int get_lod_geomorph_debug_lod() const;
+	void set_lod_geomorph_enabled(bool enabled);
+	bool get_lod_geomorph_enabled() const;
+	void set_lod_geomorph_distance(float distance);
+	float get_lod_geomorph_distance() const;
 
 	enum ProcessCallback { //
 		PROCESS_CALLBACK_IDLE = 0,
@@ -342,6 +352,7 @@ private:
 
 	void process_deferred_collision_updates(uint32_t timeout_msec);
 	void process_fading_blocks(float delta);
+	void process_lod_geomorph();
 
 	struct LocalCameraInfo {
 		Vector3 position;
@@ -415,6 +426,16 @@ private:
 	FixedArray<StdVector<Vector3i>, constants::MAX_LOD> _deferred_collision_updates_per_lod;
 
 	float _lod_fade_duration = 0.f;
+	float _lod_fade_travel_distance = 0.f;
+	Vector3 _lod_fade_previous_viewer_position;
+	bool _lod_fade_previous_viewer_position_valid = false;
+	float _lod_geomorph_debug_weight = 0.f;
+	int _lod_geomorph_debug_lod = 0;
+	bool _lod_geomorph_enabled = false;
+	float _lod_geomorph_distance = 16.f;
+	Vector3 _lod_geomorph_previous_viewer_position;
+	bool _lod_geomorph_previous_viewer_position_valid = false;
+	bool _lod_geomorph_force_update = false;
 	// Note, direct pointers to mesh blocks should be safe because these blocks are always destroyed from the same
 	// thread that updates fading blocks. If a mesh block is destroyed, these maps should be updated at the same time.
 	// TODO Optimization: use FlatMap? Need to check how many blocks get in there, probably not many

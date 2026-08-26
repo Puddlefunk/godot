@@ -60,6 +60,20 @@ void run_voxel_tests(const testing::TestOptions &options) {
 
 	using namespace zylann::tests;
 
+	// Tetra mesher tests run FIRST: they are the gate for the geomorph
+	// timeline work, and 2026-08-23 the first-ever run of this suite on the
+	// fork found test_region_file crashing (pre-existing, unrelated) before
+	// reaching them at their original position near the end.
+	VOXEL_TEST(test_voxel_mesher_tetra_lod_coordinates);
+	VOXEL_TEST(test_voxel_mesher_tetra_same_lod_border);
+	VOXEL_TEST(test_voxel_mesher_tetra_collision_surface);
+	VOXEL_TEST(test_voxel_mesher_tetra_collision_border);
+	VOXEL_TEST(test_voxel_mesher_tetra_transition_variants);
+	VOXEL_TEST(test_voxel_mesher_tetra_mixed_lod_border);
+	VOXEL_TEST(test_voxel_mesher_tetra_transition_toggle);
+	VOXEL_TEST(test_voxel_mesher_tetra_geomorph_is_edge_bounded);
+	VOXEL_TEST(test_voxel_mesher_tetra_geomorph_parent_identity);
+
 	VOXEL_TEST(test_wrap);
 	VOXEL_TEST(test_int32_to_string_base10);
 	VOXEL_TEST(test_string_base10_to_int32);
@@ -135,13 +149,6 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_flat_map);
 	VOXEL_TEST(test_expression_parser);
 	VOXEL_TEST(test_voxel_mesher_cubes);
-	VOXEL_TEST(test_voxel_mesher_tetra_lod_coordinates);
-	VOXEL_TEST(test_voxel_mesher_tetra_same_lod_border);
-	VOXEL_TEST(test_voxel_mesher_tetra_collision_surface);
-	VOXEL_TEST(test_voxel_mesher_tetra_collision_border);
-	VOXEL_TEST(test_voxel_mesher_tetra_transition_variants);
-	VOXEL_TEST(test_voxel_mesher_tetra_mixed_lod_border);
-	VOXEL_TEST(test_voxel_mesher_tetra_transition_toggle);
 	VOXEL_TEST(test_threaded_task_runner_misc);
 	VOXEL_TEST(test_threaded_task_runner_debug_names);
 	VOXEL_TEST(test_task_priority_values);

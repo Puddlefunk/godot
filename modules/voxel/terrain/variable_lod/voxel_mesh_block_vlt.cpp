@@ -100,6 +100,7 @@ void VoxelMeshBlockVLT::set_mesh(
 		}
 
 		_mesh_instance.set_mesh(mesh);
+		_geomorph_params = Vector4(-1.f, -1.f, -1.f, -1.f);
 
 		if (_shader_material.is_valid()) {
 			_mesh_instance.set_material_override(_shader_material);
@@ -144,6 +145,7 @@ void VoxelMeshBlockVLT::drop_visuals() {
 	}
 
 	detail_texture_fallback_level = 0;
+	_geomorph_params = Vector4(-1.f, -1.f, -1.f, -1.f);
 	fading_state = FADING_NONE;
 	fading_progress = 0.f;
 	visual_active = false;
@@ -441,6 +443,25 @@ void VoxelMeshBlockVLT::clear_fading() {
 	}
 }
 
+void VoxelMeshBlockVLT::set_lod_morph(float weight) {
+	set_geomorph_params(Vector4(0.f, CLAMP(weight, 0.f, 1.f), 0.f, 1.f));
+}
+
+void VoxelMeshBlockVLT::set_lod_morph_band(float inner_radius_world, float outer_radius_world) {
+	set_geomorph_params(Vector4(1.f, 0.f, inner_radius_world, outer_radius_world));
+}
+
+void VoxelMeshBlockVLT::set_geomorph_params(const Vector4 &params) {
+	if (_geomorph_params == params) {
+		return;
+	}
+	_geomorph_params = params;
+	if (_shader_material.is_valid()) {
+		static const StringName morph_params_name("u_morph_params");
+		_shader_material->set_shader_parameter(morph_params_name, params);
+	}
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 bool is_mesh_empty(Span<const VoxelMesher::Output::Surface> surfaces) {
@@ -455,7 +476,7 @@ bool is_mesh_empty(Span<const VoxelMesher::Output::Surface> surfaces) {
 Ref<ArrayMesh> build_mesh(
 		Span<const VoxelMesher::Output::Surface> surfaces,
 		Mesh::PrimitiveType primitive,
-		int flags,
+		uint64_t flags,
 		Ref<Material> material
 ) {
 	ZN_PROFILE_SCOPE();
@@ -477,11 +498,18 @@ Ref<ArrayMesh> build_mesh(
 
 		if (mesh.is_null()) {
 			mesh.instantiate();
+			for (int shape_index = 0; shape_index < surface.blend_shapes.size(); ++shape_index) {
+				mesh->add_blend_shape(StringName("voxel_morph_" + itos(shape_index)));
+			}
+			if (!surface.blend_shapes.is_empty()) {
+				mesh->set_blend_shape_mode(Mesh::BLEND_SHAPE_MODE_NORMALIZED);
+			}
 		}
+		ERR_CONTINUE(mesh->get_blend_shape_count() != surface.blend_shapes.size());
 
 		// TODO Use `add_surface`, it's about 20% faster after measuring in Tracy (though we may see if Godot 4 expects
 		// the same)
-		mesh->add_surface_from_arrays(primitive, arrays, Array(), Dictionary(), flags);
+		mesh->add_surface_from_arrays(primitive, arrays, surface.blend_shapes, Dictionary(), flags);
 		mesh->surface_set_material(surface_index, material);
 		// No multi-material supported yet
 		++surface_index;

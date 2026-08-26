@@ -100,6 +100,8 @@ public:
 	bool get_generate_tangents() const;
 	void set_lod_transitions_enabled(bool p_enabled);
 	bool get_lod_transitions_enabled() const;
+	void set_lod_geomorph_enabled(bool p_enabled);
+	bool get_lod_geomorph_enabled() const;
 
 	// Output transform baked into emitted vertex positions:
 	// final = local * vertex_scale + vertex_offset. Identity by default.
@@ -159,6 +161,7 @@ private:
 		float uv_scale = 0.35f;
 		bool generate_tangents = false;
 		bool lod_transitions_enabled = true;
+		bool lod_geomorph_enabled = false;
 		bool texturing_enabled = false;
 		float vertex_scale = 1.f;
 		Vector3 vertex_offset;

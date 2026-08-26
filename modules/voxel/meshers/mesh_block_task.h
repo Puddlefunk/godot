@@ -112,7 +112,7 @@ private:
 Ref<ArrayMesh> build_mesh( //
 		Span<const VoxelMesher::Output::Surface> surfaces, //
 		Mesh::PrimitiveType primitive, //
-		int flags, //
+		uint64_t flags, //
 		StdVector<uint16_t> &mesh_material_indices //
 );
 

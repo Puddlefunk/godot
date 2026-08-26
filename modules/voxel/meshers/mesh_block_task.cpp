@@ -235,7 +235,7 @@ void copy_block_and_neighbors(
 Ref<ArrayMesh> build_mesh(
 		Span<const VoxelMesher::Output::Surface> surfaces,
 		Mesh::PrimitiveType primitive,
-		int flags,
+		uint64_t flags,
 		// This vector indexes surfaces to the material they use (if a surface uses a material but is empty, it
 		// won't be added to the mesh)
 		StdVector<uint16_t> &mesh_material_indices
@@ -260,11 +260,18 @@ Ref<ArrayMesh> build_mesh(
 
 		if (mesh.is_null()) {
 			mesh.instantiate();
+			for (int shape_index = 0; shape_index < surface.blend_shapes.size(); ++shape_index) {
+				mesh->add_blend_shape(StringName("voxel_morph_" + itos(shape_index)));
+			}
+			if (!surface.blend_shapes.is_empty()) {
+				mesh->set_blend_shape_mode(Mesh::BLEND_SHAPE_MODE_NORMALIZED);
+			}
 		}
+		ERR_CONTINUE(mesh->get_blend_shape_count() != surface.blend_shapes.size());
 
 		// TODO Use `add_surface`, it's about 20% faster after measuring in Tracy (though we may see if Godot 4 expects
 		// the same)
-		mesh->add_surface_from_arrays(primitive, arrays, Array(), Dictionary(), flags);
+		mesh->add_surface_from_arrays(primitive, arrays, surface.blend_shapes, Dictionary(), flags);
 
 		mesh_material_indices.push_back(surface.material_index);
 	}

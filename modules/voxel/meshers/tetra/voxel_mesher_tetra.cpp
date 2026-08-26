@@ -245,18 +245,28 @@ inline uint64_t make_edge_key(uint64_t ka, uint64_t kb) {
 
 struct BuildScratch {
 	StdVector<float> densities; // Indexed by local lattice point, sign convention: >= 0 means inside.
-	StdVector<DVec3> tri_positions; // 3 entries per triangle, global voxel units.
+	// Timeline slots: every triangle lives on a sub-interval [t_in, t_out] of
+	// the geomorph weight. tri_positions holds its geometry at t_in,
+	// tri_morph_positions at t_out. Without geomorph there is exactly one
+	// interval [0, 1] and both sets are identical.
+	StdVector<DVec3> tri_positions; // 3 entries per triangle, global voxel units, at interval START.
+	StdVector<DVec3> tri_morph_positions; // Same, at interval END.
 	StdVector<uint64_t> tri_keys; // Weld identity per triangle corner.
 	StdVector<uint8_t> tri_emit; // 1 entry per triangle: inside the emission window?
 	StdVector<uint8_t> tri_transition_on;
 	StdVector<uint8_t> tri_transition_off;
+	StdVector<float> tri_t_in; // 1 entry per triangle.
+	StdVector<float> tri_t_out;
 
 	void clear_mesh() {
 		tri_positions.clear();
+		tri_morph_positions.clear();
 		tri_keys.clear();
 		tri_emit.clear();
 		tri_transition_on.clear();
 		tri_transition_off.clear();
+		tri_t_in.clear();
+		tri_t_out.clear();
 	}
 };
 
@@ -265,17 +275,20 @@ BuildScratch &get_tls_scratch() {
 	return tls_scratch;
 }
 
-struct WarpAccumulator {
-	DVec3 point;
-	DVec3 normal_sum;
-};
-
 } // namespace tetra_mesher
 
 using namespace tetra_mesher;
 
 VoxelMesherTetra::VoxelMesherTetra() {
-	set_padding(2, 2);
+	// One extra layer of MAX-side padding so the parent (stride-2) lattice
+	// covers the one-cell accumulation skirt. Without it, the skirt on every
+	// block's max faces samples the parent field past its last cube
+	// (sample_parent_tetra_density's clamp turns into EXTRAPOLATION, f up to
+	// 1.5), the morph warp fans built from those values differ from the
+	// neighboring block's -- whose min side is properly padded -- and the
+	// geomorphed surface steps at the seam. Measured live 2026-08-23 as the
+	// long LOD-seam slit.
+	set_padding(2, 3);
 }
 
 VoxelMesherTetra::~VoxelMesherTetra() {}
@@ -449,6 +462,14 @@ void VoxelMesherTetra::build_internal(
 	};
 
 	const double area_epsilon = 1.0e-8 * world_step * world_step * world_step * world_step;
+	// Slot REJECTION uses a far tighter bar than fan/normal hygiene above:
+	// area_epsilon scales with step^4, so the same WORLD-SPACE sliver is
+	// judged 16x more leniently one LOD up -- the coarse build culled slivers
+	// the fine build kept, and the w=1 identity broke by exactly those
+	// missing triangles (found 2026-08-23 via the parent-identity test: a
+	// 4.8 mm hole where the surface grazes a parent lattice corner). Slivers
+	// are load-bearing; only true degeneracy may be dropped.
+	const double reject_epsilon = 1.0e-14 * world_step * world_step * world_step * world_step;
 
 	const Vector3i parent_source_size(
 			(buffer_size.x + 1) / 2, (buffer_size.y + 1) / 2, (buffer_size.z + 1) / 2);
@@ -456,6 +477,39 @@ void VoxelMesherTetra::build_internal(
 			(parent_source_size.x - 1) * r + 1,
 			(parent_source_size.y - 1) * r + 1,
 			(parent_source_size.z - 1) * r + 1);
+	const auto sample_kuhn_cube = [](const double values[8], const double f[3]) -> double {
+		int axes[3] = { 0, 1, 2 };
+		if (f[axes[0]] < f[axes[1]]) {
+			std::swap(axes[0], axes[1]);
+		}
+		if (f[axes[1]] < f[axes[2]]) {
+			std::swap(axes[1], axes[2]);
+		}
+		if (f[axes[0]] < f[axes[1]]) {
+			std::swap(axes[0], axes[1]);
+		}
+		const auto corner_from_axes = [](int a, int b) -> int {
+			int coords[3] = { 0, 0, 0 };
+			if (a >= 0) {
+				coords[a] = 1;
+			}
+			if (b >= 0) {
+				coords[b] = 1;
+			}
+			for (int ci = 0; ci < 8; ++ci) {
+				if (CUBE_CORNERS[ci][0] == coords[0] && CUBE_CORNERS[ci][1] == coords[1] &&
+						CUBE_CORNERS[ci][2] == coords[2]) {
+					return ci;
+				}
+			}
+			return 0;
+		};
+		const int c1 = corner_from_axes(axes[0], -1);
+		const int c2 = corner_from_axes(axes[0], axes[1]);
+		return values[0] * (1.0 - f[axes[0]]) + values[c1] * (f[axes[0]] - f[axes[1]]) +
+				values[c2] * (f[axes[1]] - f[axes[2]]) + values[6] * f[axes[2]];
+	};
+	const bool geomorph_enabled = input.lod_hint && params.lod_geomorph_enabled;
 
 	const auto interpolate_parent_lattice_density = [&](int px, int py, int pz) -> double {
 		const int x0 = MIN(px / r, parent_source_size.x - 2);
@@ -468,24 +522,33 @@ void VoxelMesherTetra::build_internal(
 		const int sy = y0 * 2;
 		const int sz = z0 * 2;
 
-		const double c000 = sdf_samples[sample_index(sx, sy, sz)];
-		const double c100 = sdf_samples[sample_index(sx + 2, sy, sz)];
-		const double c010 = sdf_samples[sample_index(sx, sy + 2, sz)];
-		const double c110 = sdf_samples[sample_index(sx + 2, sy + 2, sz)];
-		const double c001 = sdf_samples[sample_index(sx, sy, sz + 2)];
-		const double c101 = sdf_samples[sample_index(sx + 2, sy, sz + 2)];
-		const double c011 = sdf_samples[sample_index(sx, sy + 2, sz + 2)];
-		const double c111 = sdf_samples[sample_index(sx + 2, sy + 2, sz + 2)];
-		const double x00 = c000 + (c100 - c000) * fx;
-		const double x10 = c010 + (c110 - c010) * fx;
-		const double x01 = c001 + (c101 - c001) * fx;
-		const double x11 = c011 + (c111 - c011) * fx;
+		double values[8];
+		for (int ci = 0; ci < 8; ++ci) {
+			values[ci] = -sdf_samples[sample_index(
+					sx + CUBE_CORNERS[ci][0] * 2,
+					sy + CUBE_CORNERS[ci][1] * 2,
+					sz + CUBE_CORNERS[ci][2] * 2)];
+		}
+		// LAYER 1 of the parent reconstruction: voxels -> parent marching
+		// lattice. The parent block's own "Density lattice" pass refines the
+		// SDF between voxel samples TRILINEARLY (see the pass above), so this
+		// layer must be trilinear too, or the reconstruction targets a surface
+		// the parent never actually meshes at subdivisions > 1. Kuhn P1
+		// belongs one layer DOWN, inside parent marching cells
+		// (sample_parent_tetra_density), where the parent's tetrahedra live.
+		// At subdivisions == 1 the two layers coincide and either is exact,
+		// which is how a Kuhn-everywhere version validated before it opened
+		// LOD-seam cracks at the shipping subdivision count.
+		const double x00 = values[0] + (values[1] - values[0]) * fx;
+		const double x10 = values[3] + (values[2] - values[3]) * fx;
+		const double x01 = values[4] + (values[5] - values[4]) * fx;
+		const double x11 = values[7] + (values[6] - values[7]) * fx;
 		const double y0v = x00 + (x10 - x00) * fy;
 		const double y1v = x01 + (x11 - x01) * fy;
-		return -(y0v + (y1v - y0v) * fz);
+		return y0v + (y1v - y0v) * fz;
 	};
 	StdVector<float> parent_densities;
-	if (input.lod_hint && params.lod_transitions_enabled) {
+	if (input.lod_hint && (params.lod_transitions_enabled || geomorph_enabled)) {
 		parent_densities.resize(
 				static_cast<size_t>(parent_lattice_points.x) * parent_lattice_points.y * parent_lattice_points.z);
 		size_t density_index = 0;
@@ -522,45 +585,40 @@ void VoxelMesherTetra::build_internal(
 					base[2] + CUBE_CORNERS[ci][2]);
 		}
 
-		int axes[3] = { 0, 1, 2 };
-		if (f[axes[0]] < f[axes[1]]) {
-			std::swap(axes[0], axes[1]);
-		}
-		if (f[axes[1]] < f[axes[2]]) {
-			std::swap(axes[1], axes[2]);
-		}
-		if (f[axes[0]] < f[axes[1]]) {
-			std::swap(axes[0], axes[1]);
-		}
+		return sample_kuhn_cube(values, f);
+	};
 
-		const auto corner_from_axes = [](int a, int b) -> int {
-			int coords[3] = { 0, 0, 0 };
-			if (a >= 0) {
-				coords[a] = 1;
-			}
-			if (b >= 0) {
-				coords[b] = 1;
-			}
-			for (int ci = 0; ci < 8; ++ci) {
-				if (CUBE_CORNERS[ci][0] == coords[0] && CUBE_CORNERS[ci][1] == coords[1] &&
-						CUBE_CORNERS[ci][2] == coords[2]) {
-					return ci;
+	// Parent P1 field sampled once per FINE lattice point. Two wins: the march
+	// stops paying up to 8 Kuhn interpolations per cell for EVERY cell in the
+	// accumulation window (they used to run before the surface early-out, so
+	// mostly on empty cells), and every consumer below -- geomorph targets and
+	// transition corners alike -- reads the exact same value per lattice
+	// point.
+	StdVector<float> fine_parent_densities;
+	if (!parent_densities.empty()) {
+		ZN_PROFILE_SCOPE_NAMED("Parent fine lattice");
+		fine_parent_densities.resize(scratch.densities.size());
+		size_t fpd_index = 0;
+		for (int lz = 0; lz < lattice_points.z; ++lz) {
+			for (int ly = 0; ly < lattice_points.y; ++ly) {
+				for (int lx = 0; lx < lattice_points.x; ++lx) {
+					fine_parent_densities[fpd_index++] =
+							static_cast<float>(sample_parent_tetra_density(lx, ly, lz));
 				}
 			}
-			return 0;
-		};
-
-		const int c1 = corner_from_axes(axes[0], -1);
-		const int c2 = corner_from_axes(axes[0], axes[1]);
-		return values[0] * (1.0 - f[axes[0]]) + values[c1] * (f[axes[0]] - f[axes[1]]) +
-				values[c2] * (f[axes[1]] - f[axes[2]]) + values[6] * f[axes[2]];
-	};
+		}
+	}
+	const bool parent_field_available = !fine_parent_densities.empty();
 
 	{
 		ZN_PROFILE_SCOPE_NAMED("March");
 
 		DVec3 corner_positions[8];
-		double corner_values[8];
+		double base_values[8]; // Fine field, after transition substitution: the field at w=0.
+		double parent_values[8]; // Parent field: the field at w=1.
+		double start_values[8]; // Field at the current interval's start time.
+		double end_values[8]; // Field at the current interval's end time.
+		double case_values[8]; // Field at the current interval's midpoint -- the sign source.
 		uint64_t corner_keys[8];
 		uint8_t corner_border_masks[8];
 		int inside[4];
@@ -568,112 +626,209 @@ void VoxelMesherTetra::build_internal(
 		int slots[4];
 		uint8_t transition_on = 0;
 		uint8_t transition_off = 0;
+		float interval_t_in = 0.f;
+		float interval_t_out = 1.f;
 
-		const auto emit_edge_vertex = [&](int i, int j, DVec3 &out_pos, uint64_t &out_key) {
-			int lo = i;
-			int hi = j;
-			if (corner_keys[j] < corner_keys[i]) {
-				lo = j;
-				hi = i;
-			}
-			out_pos = edge_interp(corner_positions[lo], corner_positions[hi], corner_values[lo], corner_values[hi]);
-			out_key = make_edge_key(corner_keys[i], corner_keys[j]);
-			const uint8_t modified_faces = (corner_border_masks[i] | corner_border_masks[j]) & transition_on;
-			if (modified_faces != 0) {
-				out_key ^= static_cast<uint64_t>(modified_faces) * 0xD6E8FEB86659FD93ull;
-				out_key ^= out_key >> 31;
-			}
-		};
+		// ---------------------------------------------------------------
+		// THE TIMELINE (2026-08-23): the morphed field at a lattice vertex is
+		// the lerp f(t) = (1-t)*f0 + t*f1, so each vertex changes sign at most
+		// once, at t* = f0/(f0-f1), and a tetrahedron passes through at most 5
+		// marching cases as t goes 0 -> 1 -- the intervals between its
+		// corners' flip times. Each interval's triangles are emitted as their
+		// own slots carrying [t_in, t_out] plus geometry evaluated at both
+		// ends; the vertex shader collapses a slot outside its window and
+		// lerps inside it. Births and deaths therefore happen at their TRUE
+		// times (the geometry is continuous through each event: a dying
+		// triangle's crossings reach the flipping corner exactly at t*, where
+		// the next interval's triangles start), and w=0 / w=1 reproduce the
+		// fine and parent surfaces exactly. The only approximation left is
+		// linear vertex motion WITHIN an interval (the true crossing motion is
+		// rational in t) -- bounded, monotone, and endpoint-exact.
+		// Blend shapes cannot express any of this; they are no longer used.
+		// ---------------------------------------------------------------
 
-		const auto add_triangle = [&](const DVec3 &a, uint64_t key_a, const DVec3 &b, uint64_t key_b, const DVec3 &c,
-										  uint64_t key_c, bool emit) {
-			// Reject only genuine degeneracy, measured relative to the step:
-			// small triangles are load-bearing in marching tetrahedra.
-			if ((b - a).cross(c - a).length_squared() < area_epsilon) {
+		const auto emit_edge_vertex =
+				[&](int i, int j, DVec3 &out_start, DVec3 &out_end, uint64_t &out_key) {
+					int lo = i;
+					int hi = j;
+					if (corner_keys[j] < corner_keys[i]) {
+						lo = j;
+						hi = i;
+					}
+					out_start = edge_interp(
+							corner_positions[lo], corner_positions[hi], start_values[lo], start_values[hi]);
+					out_end = edge_interp(
+							corner_positions[lo], corner_positions[hi], end_values[lo], end_values[hi]);
+					out_key = make_edge_key(corner_keys[i], corner_keys[j]);
+					const uint8_t modified_faces = (corner_border_masks[i] | corner_border_masks[j]) & transition_on;
+					if (modified_faces != 0) {
+						out_key ^= static_cast<uint64_t>(modified_faces) * 0xD6E8FEB86659FD93ull;
+						out_key ^= out_key >> 31;
+					}
+				};
+
+		const auto add_triangle = [&](const DVec3 &a_start, const DVec3 &a_end, uint64_t key_a, //
+										  const DVec3 &b_start, const DVec3 &b_end, uint64_t key_b, //
+										  const DVec3 &c_start, const DVec3 &c_end, uint64_t key_c, bool emit) {
+			// A slot earns its place with area at EITHER end of its interval:
+			// births are degenerate at t_in by construction, deaths at t_out.
+			// Only a triangle degenerate at both ends carries nothing.
+			const bool start_has_area =
+					(b_start - a_start).cross(c_start - a_start).length_squared() >= reject_epsilon;
+			const bool end_has_area = (b_end - a_end).cross(c_end - a_end).length_squared() >= reject_epsilon;
+			if (!start_has_area && !end_has_area) {
 				return;
 			}
-			scratch.tri_positions.push_back(a);
-			scratch.tri_positions.push_back(b);
-			scratch.tri_positions.push_back(c);
+			scratch.tri_positions.push_back(a_start);
+			scratch.tri_positions.push_back(b_start);
+			scratch.tri_positions.push_back(c_start);
+			scratch.tri_morph_positions.push_back(a_end);
+			scratch.tri_morph_positions.push_back(b_end);
+			scratch.tri_morph_positions.push_back(c_end);
 			scratch.tri_keys.push_back(key_a);
 			scratch.tri_keys.push_back(key_b);
 			scratch.tri_keys.push_back(key_c);
 			scratch.tri_emit.push_back(emit ? 1 : 0);
 			scratch.tri_transition_on.push_back(transition_on);
 			scratch.tri_transition_off.push_back(transition_off);
+			scratch.tri_t_in.push_back(interval_t_in);
+			scratch.tri_t_out.push_back(interval_t_out);
 		};
 
+		// One marching case, one interval. Signs come from case_values
+		// (interval midpoint, where no corner is at zero); positions come from
+		// start_values / end_values.
+		const auto polygonise_tet_interval = [&](const int8_t *tet, bool emit) {
+			int inside_count = 0;
+			int outside_count = 0;
+			for (int k = 0; k < 4; ++k) {
+				const int corner_index = tet[k];
+				if (case_values[corner_index] >= 0.0) {
+					inside[inside_count++] = corner_index;
+				} else {
+					outside[outside_count++] = corner_index;
+				}
+			}
+			if (inside_count == 0 || inside_count == 4) {
+				return;
+			}
+
+			if (inside_count == 1) {
+				const int a = inside[0];
+				slots[0] = tet_slot_of(tet, a);
+				slots[1] = tet_slot_of(tet, outside[0]);
+				slots[2] = tet_slot_of(tet, outside[1]);
+				slots[3] = tet_slot_of(tet, outside[2]);
+				DVec3 p0s, p1s, p2s, p0e, p1e, p2e;
+				uint64_t k0, k1, k2;
+				emit_edge_vertex(a, outside[0], p0s, p0e, k0);
+				emit_edge_vertex(a, outside[1], p1s, p1e, k1);
+				emit_edge_vertex(a, outside[2], p2s, p2e, k2);
+				if (permutation_is_even(slots)) {
+					add_triangle(p0s, p0e, k0, p1s, p1e, k1, p2s, p2e, k2, emit);
+				} else {
+					add_triangle(p0s, p0e, k0, p2s, p2e, k2, p1s, p1e, k1, emit);
+				}
+			} else if (inside_count == 3) {
+				const int a = outside[0];
+				slots[0] = tet_slot_of(tet, a);
+				slots[1] = tet_slot_of(tet, inside[0]);
+				slots[2] = tet_slot_of(tet, inside[1]);
+				slots[3] = tet_slot_of(tet, inside[2]);
+				DVec3 q0s, q1s, q2s, q0e, q1e, q2e;
+				uint64_t j0, j1, j2;
+				emit_edge_vertex(a, inside[2], q0s, q0e, j0);
+				emit_edge_vertex(a, inside[1], q1s, q1e, j1);
+				emit_edge_vertex(a, inside[0], q2s, q2e, j2);
+				if (permutation_is_even(slots)) {
+					add_triangle(q0s, q0e, j0, q1s, q1e, j1, q2s, q2e, j2, emit);
+				} else {
+					add_triangle(q0s, q0e, j0, q2s, q2e, j2, q1s, q1e, j1, emit);
+				}
+			} else {
+				const int a = inside[0];
+				const int b = inside[1];
+				const int c = outside[0];
+				const int d = outside[1];
+				slots[0] = tet_slot_of(tet, a);
+				slots[1] = tet_slot_of(tet, b);
+				slots[2] = tet_slot_of(tet, c);
+				slots[3] = tet_slot_of(tet, d);
+				DVec3 acs, ads, bcs, bds, ace, ade, bce, bde;
+				uint64_t ac_key, ad_key, bc_key, bd_key;
+				emit_edge_vertex(a, c, acs, ace, ac_key);
+				emit_edge_vertex(a, d, ads, ade, ad_key);
+				emit_edge_vertex(b, c, bcs, bce, bc_key);
+				emit_edge_vertex(b, d, bds, bde, bd_key);
+				if (permutation_is_even(slots)) {
+					add_triangle(acs, ace, ac_key, bds, bde, bd_key, bcs, bce, bc_key, emit);
+					add_triangle(acs, ace, ac_key, ads, ade, ad_key, bds, bde, bd_key, emit);
+				} else {
+					add_triangle(acs, ace, ac_key, bcs, bce, bc_key, bds, bde, bd_key, emit);
+					add_triangle(acs, ace, ac_key, bds, bde, bd_key, ads, ade, ad_key, emit);
+				}
+			}
+		};
+
+		// Marches every tetrahedron of the current cell through its full
+		// timeline. base_values/parent_values must hold the w=0 / w=1 fields
+		// (after any transition substitution); without geomorph they are
+		// identical and this degenerates to exactly one interval [0, 1].
 		const auto polygonise_cell = [&](bool emit) {
 			for (int ti = 0; ti < 6; ++ti) {
 				const int8_t *tet = TETRAHEDRA[ti];
-				int inside_count = 0;
-				int outside_count = 0;
+
+				// Distinct flip times of this tet's corners, sorted.
+				double flips[4];
+				int flip_count = 0;
 				for (int k = 0; k < 4; ++k) {
-					const int corner_index = tet[k];
-					if (corner_values[corner_index] >= 0.0) {
-						inside[inside_count++] = corner_index;
-					} else {
-						outside[outside_count++] = corner_index;
+					const int ci = tet[k];
+					const double f0 = base_values[ci];
+					const double f1 = parent_values[ci];
+					if ((f0 >= 0.0) == (f1 >= 0.0)) {
+						continue;
 					}
-				}
-				if (inside_count == 0 || inside_count == 4) {
-					continue;
+					const double denom = f0 - f1;
+					if (std::abs(denom) < 1.0e-12) {
+						continue;
+					}
+					const double t_flip = CLAMP(f0 / denom, 0.0, 1.0);
+					bool duplicate = false;
+					for (int fi = 0; fi < flip_count; ++fi) {
+						if (std::abs(flips[fi] - t_flip) < 1.0e-6) {
+							duplicate = true;
+							break;
+						}
+					}
+					if (!duplicate) {
+						int at = flip_count++;
+						while (at > 0 && flips[at - 1] > t_flip) {
+							flips[at] = flips[at - 1];
+							--at;
+						}
+						flips[at] = t_flip;
+					}
 				}
 
-				if (inside_count == 1) {
-					const int a = inside[0];
-					slots[0] = tet_slot_of(tet, a);
-					slots[1] = tet_slot_of(tet, outside[0]);
-					slots[2] = tet_slot_of(tet, outside[1]);
-					slots[3] = tet_slot_of(tet, outside[2]);
-					DVec3 p0, p1, p2;
-					uint64_t k0, k1, k2;
-					emit_edge_vertex(a, outside[0], p0, k0);
-					emit_edge_vertex(a, outside[1], p1, k1);
-					emit_edge_vertex(a, outside[2], p2, k2);
-					if (permutation_is_even(slots)) {
-						add_triangle(p0, k0, p1, k1, p2, k2, emit);
-					} else {
-						add_triangle(p0, k0, p2, k2, p1, k1, emit);
+				double t_prev = 0.0;
+				for (int fi = 0; fi <= flip_count; ++fi) {
+					const double t_next = fi < flip_count ? flips[fi] : 1.0;
+					if (t_next - t_prev < 1.0e-6) {
+						t_prev = t_next;
+						continue;
 					}
-				} else if (inside_count == 3) {
-					const int a = outside[0];
-					slots[0] = tet_slot_of(tet, a);
-					slots[1] = tet_slot_of(tet, inside[0]);
-					slots[2] = tet_slot_of(tet, inside[1]);
-					slots[3] = tet_slot_of(tet, inside[2]);
-					DVec3 q0, q1, q2;
-					uint64_t j0, j1, j2;
-					emit_edge_vertex(a, inside[2], q0, j0);
-					emit_edge_vertex(a, inside[1], q1, j1);
-					emit_edge_vertex(a, inside[0], q2, j2);
-					if (permutation_is_even(slots)) {
-						add_triangle(q0, j0, q1, j1, q2, j2, emit);
-					} else {
-						add_triangle(q0, j0, q2, j2, q1, j1, emit);
+					const double t_mid = 0.5 * (t_prev + t_next);
+					for (int ci = 0; ci < 8; ++ci) {
+						const double f0 = base_values[ci];
+						const double f1 = parent_values[ci];
+						start_values[ci] = f0 + (f1 - f0) * t_prev;
+						end_values[ci] = f0 + (f1 - f0) * t_next;
+						case_values[ci] = f0 + (f1 - f0) * t_mid;
 					}
-				} else {
-					const int a = inside[0];
-					const int b = inside[1];
-					const int c = outside[0];
-					const int d = outside[1];
-					slots[0] = tet_slot_of(tet, a);
-					slots[1] = tet_slot_of(tet, b);
-					slots[2] = tet_slot_of(tet, c);
-					slots[3] = tet_slot_of(tet, d);
-					DVec3 ac, ad, bc, bd;
-					uint64_t ac_key, ad_key, bc_key, bd_key;
-					emit_edge_vertex(a, c, ac, ac_key);
-					emit_edge_vertex(a, d, ad, ad_key);
-					emit_edge_vertex(b, c, bc, bc_key);
-					emit_edge_vertex(b, d, bd, bd_key);
-					if (permutation_is_even(slots)) {
-						add_triangle(ac, ac_key, bd, bd_key, bc, bc_key, emit);
-						add_triangle(ac, ac_key, ad, ad_key, bd, bd_key, emit);
-					} else {
-						add_triangle(ac, ac_key, bc, bc_key, bd, bd_key, emit);
-						add_triangle(ac, ac_key, bd, bd_key, ad, ad_key, emit);
-					}
+					interval_t_in = static_cast<float>(t_prev);
+					interval_t_out = static_cast<float>(t_next);
+					polygonise_tet_interval(tet, emit);
+					t_prev = t_next;
 				}
 			}
 		};
@@ -681,18 +836,21 @@ void VoxelMesherTetra::build_internal(
 		for (int cx = acc_min; cx < acc_max.x; ++cx) {
 			for (int cy = acc_min; cy < acc_max.y; ++cy) {
 				for (int cz = acc_min; cz < acc_max.z; ++cz) {
+					// Originals, preserved across transition subsets (which
+					// substitute into base_values/parent_values per pass).
+					double cell_fine[8];
+					double cell_parent[8];
 					bool any_inside = false;
 					bool any_outside = false;
-					double base_values[8];
-					double parent_values[8];
 					for (int ci = 0; ci < 8; ++ci) {
 						const int lx = cx + CUBE_CORNERS[ci][0];
 						const int ly = cy + CUBE_CORNERS[ci][1];
 						const int lz = cz + CUBE_CORNERS[ci][2];
 						const double value = scratch.densities[lattice_index(lx, ly, lz)];
-						corner_values[ci] = value;
-						base_values[ci] = value;
-						parent_values[ci] = value;
+						cell_fine[ci] = value;
+						cell_parent[ci] = parent_field_available
+								? static_cast<double>(fine_parent_densities[lattice_index(lx, ly, lz)])
+								: value;
 						if (value >= 0.0) {
 							any_inside = true;
 						} else {
@@ -723,18 +881,15 @@ void VoxelMesherTetra::build_internal(
 					}
 
 					const bool transition_cell = input.lod_hint && params.lod_transitions_enabled && cell_border_mask != 0;
-					if (transition_cell) {
+					if (transition_cell || geomorph_enabled) {
+						// A cell can carry surface at ANY point of the
+						// timeline: birth slots exist wherever the PARENT
+						// field crosses, even where the fine field does not.
 						bool possible_inside = false;
 						bool possible_outside = false;
 						for (int ci = 0; ci < 8; ++ci) {
-							if (corner_border_masks[ci] != 0) {
-								const int lx = cx + CUBE_CORNERS[ci][0];
-								const int ly = cy + CUBE_CORNERS[ci][1];
-								const int lz = cz + CUBE_CORNERS[ci][2];
-								parent_values[ci] = sample_parent_tetra_density(lx, ly, lz);
-							}
-							possible_inside |= base_values[ci] >= 0.0 || parent_values[ci] >= 0.0;
-							possible_outside |= base_values[ci] < 0.0 || parent_values[ci] < 0.0;
+							possible_inside |= cell_fine[ci] >= 0.0 || cell_parent[ci] >= 0.0;
+							possible_outside |= cell_fine[ci] < 0.0 || cell_parent[ci] < 0.0;
 						}
 						if (!(possible_inside && possible_outside)) {
 							continue;
@@ -760,11 +915,14 @@ void VoxelMesherTetra::build_internal(
 							transition_on = subset;
 							transition_off = cell_border_mask & ~subset;
 							for (int ci = 0; ci < 8; ++ci) {
-								if ((corner_border_masks[ci] & subset) != 0) {
-									corner_values[ci] = parent_values[ci];
-								} else {
-									corner_values[ci] = base_values[ci];
-								}
+								// Corners stitched to the coarse neighbor take
+								// the parent value as their w=0 field; with
+								// geomorph they also keep it at w=1, so
+								// stitched geometry never moves.
+								const double stitched_fine =
+										(corner_border_masks[ci] & subset) != 0 ? cell_parent[ci] : cell_fine[ci];
+								base_values[ci] = stitched_fine;
+								parent_values[ci] = geomorph_enabled ? cell_parent[ci] : stitched_fine;
 							}
 							polygonise_cell(true);
 							if (subset == 0) {
@@ -777,6 +935,8 @@ void VoxelMesherTetra::build_internal(
 						transition_off = 0;
 						for (int ci = 0; ci < 8; ++ci) {
 							corner_border_masks[ci] = 0;
+							base_values[ci] = cell_fine[ci];
+							parent_values[ci] = geomorph_enabled ? cell_parent[ci] : cell_fine[ci];
 						}
 						polygonise_cell(emit);
 					}
@@ -793,53 +953,92 @@ void VoxelMesherTetra::build_internal(
 	}
 
 	// -----------------------------------------------------------------------
-	// Stylization: accumulate per-triangle geometric normals onto welded
-	// vertices (skirt triangles included), then evaluate the warp once per
-	// vertex. Deferring the evaluation to the averaged normal is exact, not an
-	// approximation: the warp has the form W(p) + n * R(p) with W and R
-	// depending only on p (see source).
-	StdUnorderedMap<uint64_t, WarpAccumulator> warp_map;
+	// Stylization: two fan-normal sums per welded edge key -- one accumulated
+	// from the geometry alive at t=0 (all slots with t_in == 0, skirt
+	// included), one from the geometry alive at t=1 (t_out == 1). The warp is
+	// evaluated PER EMITTED VERTEX at each of its interval endpoints, with the
+	// normal nlerp-ed between the two fans by that endpoint's time: continuous
+	// across interval handoffs (same key + same time on both sides), and
+	// seam-consistent (both fans are). W and R depend only on position, so
+	// deferring evaluation to averaged normals stays exact.
+	StdUnorderedMap<uint64_t, DVec3> fine_normal_sums;
+	StdUnorderedMap<uint64_t, DVec3> target_normal_sums;
 	if (params.warp_enabled) {
 		ZN_PROFILE_SCOPE_NAMED("Warp");
-		warp_map.reserve(triangle_count * 2);
+		fine_normal_sums.reserve(triangle_count * 2);
+		if (geomorph_enabled) {
+			target_normal_sums.reserve(triangle_count * 2);
+		}
 		for (size_t t = 0; t < triangle_count; ++t) {
 			const size_t i = t * 3;
-			const DVec3 &a = scratch.tri_positions[i];
-			const DVec3 &b = scratch.tri_positions[i + 1];
-			const DVec3 &c = scratch.tri_positions[i + 2];
-			DVec3 source_normal = (b - a).cross(c - a);
-			if (source_normal.length_squared() < area_epsilon) {
-				continue;
+			DVec3 start_normal = (scratch.tri_positions[i + 1] - scratch.tri_positions[i])
+						.cross(scratch.tri_positions[i + 2] - scratch.tri_positions[i]);
+			const bool start_ok = start_normal.length_squared() >= area_epsilon;
+			if (start_ok) {
+				start_normal = start_normal.normalized();
 			}
-			source_normal = source_normal.normalized();
-			for (int corner = 0; corner < 3; ++corner) {
-				const uint64_t key = scratch.tri_keys[i + corner];
-				auto it = warp_map.find(key);
-				if (it == warp_map.end()) {
-					WarpAccumulator acc;
-					acc.point = scratch.tri_positions[i + corner];
-					acc.normal_sum = source_normal;
-					warp_map.insert({ key, acc });
+			if (scratch.tri_t_in[t] == 0.f && start_ok) {
+				for (int corner = 0; corner < 3; ++corner) {
+					const uint64_t key = scratch.tri_keys[i + corner];
+					auto it = fine_normal_sums.find(key);
+					if (it == fine_normal_sums.end()) {
+						fine_normal_sums.insert({ key, start_normal });
+					} else {
+						it->second = it->second + start_normal;
+					}
+				}
+			}
+			if (geomorph_enabled && scratch.tri_t_out[t] == 1.f) {
+				DVec3 end_normal = (scratch.tri_morph_positions[i + 1] - scratch.tri_morph_positions[i])
+							.cross(scratch.tri_morph_positions[i + 2] - scratch.tri_morph_positions[i]);
+				if (end_normal.length_squared() >= area_epsilon) {
+					end_normal = end_normal.normalized();
+					if (start_ok && end_normal.dot(start_normal) < 0.0) {
+						end_normal = end_normal * -1.0;
+					}
+				} else if (start_ok) {
+					// Degenerate-at-1 sliver: the fine fan normal stands in so
+					// the key still exists on both sides of every seam.
+					end_normal = start_normal;
 				} else {
-					it->second.normal_sum = it->second.normal_sum + source_normal;
+					continue;
+				}
+				for (int corner = 0; corner < 3; ++corner) {
+					const uint64_t key = scratch.tri_keys[i + corner];
+					auto it = target_normal_sums.find(key);
+					if (it == target_normal_sums.end()) {
+						target_normal_sums.insert({ key, end_normal });
+					} else {
+						it->second = it->second + end_normal;
+					}
 				}
 			}
 		}
-		// Resolve in place: normal_sum becomes the warped position. The mean
-		// normal and the sum differ only by a positive scale, which the
-		// normalization inside the evaluation removes; the source divides by
-		// the count for the same reason.
-		for (auto &pair : warp_map) {
-			WarpAccumulator &acc = pair.second;
-			acc.point = stylized_surface_position(
-					acc.point,
-					acc.normal_sum.normalized(),
-					params.lattice_warp,
-					params.patch_relief,
-					params.patch_size,
-					params.patch_relief_smoothing);
-		}
 	}
+
+	// Warp displacement for one welded vertex at one timeline position.
+	const auto displaced_point = [&](uint64_t key, const DVec3 &raw, double t) -> DVec3 {
+		if (!params.warp_enabled) {
+			return raw;
+		}
+		const auto it0 = fine_normal_sums.find(key);
+		const auto it1 = target_normal_sums.find(key);
+		const bool has0 = it0 != fine_normal_sums.end();
+		const bool has1 = it1 != target_normal_sums.end();
+		if (!has0 && !has1) {
+			return raw;
+		}
+		const DVec3 n0 = (has0 ? it0->second : it1->second).normalized();
+		const DVec3 n1 = (has1 ? it1->second : it0->second).normalized();
+		DVec3 n = n0.lerp(n1, t);
+		if (n.length_squared() < 1.0e-12) {
+			n = n0;
+		} else {
+			n = n.normalized();
+		}
+		return stylized_surface_position(
+				raw, n, params.lattice_warp, params.patch_relief, params.patch_size, params.patch_relief_smoothing);
+	};
 
 	// -----------------------------------------------------------------------
 	// Emit: block-local, flat-shaded, unindexed.
@@ -850,6 +1049,12 @@ void VoxelMesherTetra::build_internal(
 	PackedFloat32Array out_tangents;
 	PackedFloat32Array out_lod_attribs;
 	PackedFloat32Array out_tex_attribs;
+	// CUSTOM2, 4 floats per vertex: xyz = position at the vertex's interval
+	// END (t_out), w = its window packed as round(t_in*4095)*4096 +
+	// round(t_out*4095) -- 24 bits, exact in float32, and never 0.0 for a
+	// real window (t_out=1 encodes 4095), so shaders can treat 0.0 as "no
+	// timeline attribute, static vertex".
+	PackedFloat32Array out_timeline_attribs;
 	StdUnorderedMap<uint64_t, int> collision_vertex_indices;
 
 	{
@@ -865,17 +1070,6 @@ void VoxelMesherTetra::build_internal(
 				static_cast<double>(content_origin.z));
 		const double v_scale = params.vertex_scale;
 		const DVec3 v_offset(params.vertex_offset.x, params.vertex_offset.y, params.vertex_offset.z);
-
-		const auto warped_of = [&](const DVec3 &p, uint64_t key) -> DVec3 {
-			if (!params.warp_enabled) {
-				return p;
-			}
-			const auto it = warp_map.find(key);
-			if (it == warp_map.end()) {
-				return p;
-			}
-			return it->second.point;
-		};
 
 		const auto triplanar_uv = [&](const DVec3 &p, const DVec3 &n) -> Vector2 {
 			const double ax = std::abs(n.x);
@@ -944,8 +1138,12 @@ void VoxelMesherTetra::build_internal(
 		if (params.texturing_enabled) {
 			out_tex_attribs.resize(max_vertices * 2);
 		}
+		if (geomorph_enabled) {
+			out_timeline_attribs.resize(max_vertices * 4);
+		}
 		float *lod_attribs_w = input.lod_hint ? out_lod_attribs.ptrw() : nullptr;
 		float *tex_attribs_w = params.texturing_enabled ? out_tex_attribs.ptrw() : nullptr;
+		float *timeline_w = geomorph_enabled ? out_timeline_attribs.ptrw() : nullptr;
 		Vector3 *vertices_w = out_vertices.ptrw();
 		Vector3 *normals_w = out_normals.ptrw();
 		Color *colors_w = out_colors.ptrw();
@@ -961,46 +1159,99 @@ void VoxelMesherTetra::build_internal(
 				continue;
 			}
 			const size_t i = t * 3;
-			DVec3 a = scratch.tri_positions[i];
-			DVec3 b = scratch.tri_positions[i + 1];
-			DVec3 c = scratch.tri_positions[i + 2];
-
-			DVec3 emit_source_normal = (b - a).cross(c - a);
-			if (emit_source_normal.length_squared() < area_epsilon) {
-				continue;
-			}
-			emit_source_normal = emit_source_normal.normalized();
-
-			DVec3 warped_a = warped_of(a, scratch.tri_keys[i]) - local_offset;
-			DVec3 warped_b = warped_of(b, scratch.tri_keys[i + 1]) - local_offset;
-			DVec3 warped_c = warped_of(c, scratch.tri_keys[i + 2]) - local_offset;
+			DVec3 start_a = scratch.tri_positions[i];
+			DVec3 start_b = scratch.tri_positions[i + 1];
+			DVec3 start_c = scratch.tri_positions[i + 2];
+			DVec3 end_a = scratch.tri_morph_positions[i];
+			DVec3 end_b = scratch.tri_morph_positions[i + 1];
+			DVec3 end_c = scratch.tri_morph_positions[i + 2];
 			uint64_t key_a = scratch.tri_keys[i];
 			uint64_t key_b = scratch.tri_keys[i + 1];
 			uint64_t key_c = scratch.tri_keys[i + 2];
+			const double t_in = scratch.tri_t_in[t];
+			const double t_out = scratch.tri_t_out[t];
 
-			DVec3 warped_normal = (warped_b - warped_a).cross(warped_c - warped_a);
-			if (warped_normal.length_squared() < area_epsilon) {
+			DVec3 start_source_normal = (start_b - start_a).cross(start_c - start_a);
+			DVec3 end_source_normal = (end_b - end_a).cross(end_c - end_a);
+			const bool start_has_area = start_source_normal.length_squared() >= reject_epsilon;
+			const bool end_has_area = end_source_normal.length_squared() >= reject_epsilon;
+			if (!start_has_area && !end_has_area) {
 				continue;
 			}
-			warped_normal = warped_normal.normalized();
-			// Guard only against the warp itself folding a triangle inside out.
-			if (warped_normal.dot(emit_source_normal) < 0.0) {
-				const DVec3 swapped_position = warped_b;
-				warped_b = warped_c;
-				warped_c = swapped_position;
-				const DVec3 swapped_source = b;
-				b = c;
-				c = swapped_source;
-				const uint64_t swapped_key = key_b;
-				key_b = key_c;
-				key_c = swapped_key;
-				warped_normal = warped_normal * -1.0;
+			if (start_has_area) {
+				start_source_normal = start_source_normal.normalized();
+			}
+			if (end_has_area) {
+				end_source_normal = end_source_normal.normalized();
+				if (start_has_area && end_source_normal.dot(start_source_normal) < 0.0) {
+					end_source_normal = end_source_normal * -1.0;
+				}
+			}
+			if (!start_has_area) {
+				start_source_normal = end_source_normal;
+			}
+			if (!end_has_area) {
+				end_source_normal = start_source_normal;
+			}
+
+			DVec3 warped_start_a = displaced_point(key_a, start_a, t_in) - local_offset;
+			DVec3 warped_start_b = displaced_point(key_b, start_b, t_in) - local_offset;
+			DVec3 warped_start_c = displaced_point(key_c, start_c, t_in) - local_offset;
+			DVec3 warped_end_a = displaced_point(key_a, end_a, t_out) - local_offset;
+			DVec3 warped_end_b = displaced_point(key_b, end_b, t_out) - local_offset;
+			DVec3 warped_end_c = displaced_point(key_c, end_c, t_out) - local_offset;
+
+			DVec3 start_normal = (warped_start_b - warped_start_a).cross(warped_start_c - warped_start_a);
+			DVec3 end_normal = (warped_end_b - warped_end_a).cross(warped_end_c - warped_end_a);
+			const bool warped_start_ok = start_normal.length_squared() >= reject_epsilon;
+			const bool warped_end_ok = end_normal.length_squared() >= reject_epsilon;
+			if (!warped_start_ok && !warped_end_ok) {
+				continue;
+			}
+			if (warped_start_ok) {
+				start_normal = start_normal.normalized();
+			}
+			if (warped_end_ok) {
+				end_normal = end_normal.normalized();
+			}
+			// Guard only against the warp itself folding a triangle inside
+			// out, judged at whichever end of the interval has area.
+			const DVec3 reference_warped = warped_start_ok ? start_normal : end_normal;
+			const DVec3 reference_source = warped_start_ok ? start_source_normal : end_source_normal;
+			if (reference_warped.dot(reference_source) < 0.0) {
+				std::swap(warped_start_b, warped_start_c);
+				std::swap(warped_end_b, warped_end_c);
+				std::swap(start_b, start_c);
+				std::swap(end_b, end_c);
+				std::swap(key_b, key_c);
+				start_normal = start_normal * -1.0;
+				end_normal = end_normal * -1.0;
+			}
+			if (!warped_start_ok) {
+				start_normal = end_normal;
+			} else if (!warped_end_ok) {
+				end_normal = start_normal;
+			} else if (end_normal.dot(start_normal) < 0.0) {
+				end_normal = end_normal * -1.0;
 			}
 
 			const Vector3 gd_normal(
-					static_cast<real_t>(warped_normal.x),
-					static_cast<real_t>(warped_normal.y),
-					static_cast<real_t>(warped_normal.z));
+					static_cast<real_t>(start_normal.x),
+					static_cast<real_t>(start_normal.y),
+					static_cast<real_t>(start_normal.z));
+			const Vector3 gd_end_normal(
+					static_cast<real_t>(end_normal.x),
+					static_cast<real_t>(end_normal.y),
+					static_cast<real_t>(end_normal.z));
+			float packed_window = 0.f;
+			if (timeline_w != nullptr) {
+				const uint32_t t_in_code = static_cast<uint32_t>(std::lround(t_in * 4095.0));
+				uint32_t t_out_code = static_cast<uint32_t>(std::lround(t_out * 4095.0));
+				if (t_out_code == 0u) {
+					t_out_code = 1u;
+				}
+				packed_window = static_cast<float>(t_in_code * 4096u + t_out_code);
+			}
 
 			// Tangent frame aligned to the dominant-axis texture projection,
 			// INCLUDING handedness. Godot's BaseMaterial3D triplanar samples
@@ -1011,12 +1262,15 @@ void VoxelMesherTetra::build_internal(
 			// the facing direction of the dominant axis, which is what a constant
 			// w gets wrong: half the faces sample a mirrored normal map, and
 			// high-contrast maps glint where they should shadow.
+			// Tangents are built for the interval START; morph-time tangent
+			// rotation is not modeled (the demo's terrain shaders are
+			// tangent-free).
 			DVec3 tangent;
 			float tangent_w = 1.f;
 			if (tangents_w != nullptr) {
-				const double ax = std::abs(warped_normal.x);
-				const double ay = std::abs(warped_normal.y);
-				const double az = std::abs(warped_normal.z);
+				const double ax = std::abs(start_normal.x);
+				const double ay = std::abs(start_normal.y);
+				const double az = std::abs(start_normal.z);
 				DVec3 u_axis;
 				DVec3 v_axis;
 				if (ay >= ax && ay >= az) {
@@ -1029,41 +1283,62 @@ void VoxelMesherTetra::build_internal(
 					u_axis = DVec3(1.0, 0.0, 0.0);
 					v_axis = DVec3(0.0, -1.0, 0.0);
 				}
-				tangent = (u_axis - warped_normal * u_axis.dot(warped_normal)).normalized();
-				tangent_w = warped_normal.cross(tangent).dot(v_axis) >= 0.0 ? 1.f : -1.f;
+				tangent = (u_axis - start_normal * u_axis.dot(start_normal)).normalized();
+				tangent_w = start_normal.cross(tangent).dot(v_axis) >= 0.0 ? 1.f : -1.f;
 			}
 
 			// The marching step emits the mathematical convention
 			// (counter-clockwise seen from outside); Godot's rasterizer treats
 			// the opposite handedness as front-facing, so corners b and c swap
 			// on the way out. The normal stays outward regardless.
-			const DVec3 *emit_positions[3] = { &warped_a, &warped_c, &warped_b };
-			const DVec3 *source_positions[3] = { &a, &c, &b };
+			const DVec3 *emit_start[3] = { &warped_start_a, &warped_start_c, &warped_start_b };
+			const DVec3 *emit_end[3] = { &warped_end_a, &warped_end_c, &warped_end_b };
+			// UVs and material sampling use UN-warped positions (the material
+			// belongs to where the surface mathematically is, not where the
+			// stylization pushed it), taken from whichever interval end has
+			// area -- a birth is degenerate at its start.
+			const DVec3 *sample_positions[3] = { start_has_area ? &start_a : &end_a,
+				start_has_area ? &start_c : &end_c, start_has_area ? &start_b : &end_b };
+			const DVec3 &sample_normal = start_has_area ? start_source_normal : end_source_normal;
 			const uint64_t emit_keys[3] = { key_a, key_c, key_b };
 			const uint32_t transition_flags = static_cast<uint32_t>(scratch.tri_transition_on[t]) |
 					(static_cast<uint32_t>(scratch.tri_transition_off[t]) << 6);
 			for (int corner = 0; corner < 3; ++corner) {
-				const DVec3 p = (*emit_positions[corner]) * v_scale + v_offset;
+				const DVec3 p = (*emit_start[corner]) * v_scale + v_offset;
 				vertices_w[vertex_count] = Vector3(
 						static_cast<real_t>(p.x), static_cast<real_t>(p.y), static_cast<real_t>(p.z));
 				normals_w[vertex_count] = gd_normal;
 				colors_w[vertex_count] = params.default_color;
-				uvs_w[vertex_count] = triplanar_uv(*source_positions[corner], warped_normal);
+				uvs_w[vertex_count] = triplanar_uv(*sample_positions[corner], sample_normal);
 				if (lod_attribs_w != nullptr) {
 					const size_t li = vertex_count * 4;
-					lod_attribs_w[li] = static_cast<float>(p.x);
-					lod_attribs_w[li + 1] = static_cast<float>(p.y);
-					lod_attribs_w[li + 2] = static_cast<float>(p.z);
+					if (timeline_w != nullptr) {
+						// With a timeline present, CUSTOM0.xyz carries the
+						// interval-END face normal (the shader lerps NORMAL
+						// toward it); the old position copy carried no
+						// information the shaders used.
+						lod_attribs_w[li] = static_cast<float>(end_normal.x);
+						lod_attribs_w[li + 1] = static_cast<float>(end_normal.y);
+						lod_attribs_w[li + 2] = static_cast<float>(end_normal.z);
+					} else {
+						lod_attribs_w[li] = static_cast<float>(p.x);
+						lod_attribs_w[li + 1] = static_cast<float>(p.y);
+						lod_attribs_w[li + 2] = static_cast<float>(p.z);
+					}
 					memcpy(&lod_attribs_w[li + 3], &transition_flags, sizeof(float));
 				}
+				if (timeline_w != nullptr) {
+					const size_t wi = vertex_count * 4;
+					const DVec3 ep = (*emit_end[corner]) * v_scale + v_offset;
+					timeline_w[wi] = static_cast<float>(ep.x);
+					timeline_w[wi + 1] = static_cast<float>(ep.y);
+					timeline_w[wi + 2] = static_cast<float>(ep.z);
+					timeline_w[wi + 3] = packed_window;
+				}
 				if (tex_attribs_w != nullptr) {
-					// Sampled at the UN-warped position: the warp moves a
-					// vertex up to lattice_warp + patch_relief away, and the
-					// material belongs to where the surface mathematically is,
-					// not to where the stylization pushed it.
 					const size_t xi = vertex_count * 2;
 					sample_tex_attrib(
-							*source_positions[corner], warped_normal, tex_attribs_w[xi], tex_attribs_w[xi + 1]);
+							*sample_positions[corner], sample_normal, tex_attribs_w[xi], tex_attribs_w[xi + 1]);
 				}
 				if (tangents_w != nullptr) {
 					const size_t ti = vertex_count * 4;
@@ -1072,7 +1347,8 @@ void VoxelMesherTetra::build_internal(
 					tangents_w[ti + 2] = static_cast<float>(tangent.z);
 					tangents_w[ti + 3] = tangent_w;
 				}
-				if (input.collision_hint && scratch.tri_transition_on[t] == 0) {
+				if (input.collision_hint && scratch.tri_transition_on[t] == 0 && scratch.tri_t_in[t] == 0.f &&
+						start_has_area) {
 					auto found = collision_vertex_indices.find(emit_keys[corner]);
 					int collision_index;
 					if (found == collision_vertex_indices.end()) {
@@ -1105,6 +1381,9 @@ void VoxelMesherTetra::build_internal(
 		}
 		if (tex_attribs_w != nullptr) {
 			out_tex_attribs.resize(vertex_count * 2);
+		}
+		if (timeline_w != nullptr) {
+			out_timeline_attribs.resize(vertex_count * 4);
 		}
 	}
 
@@ -1143,6 +1422,14 @@ void VoxelMesherTetra::build_internal(
 		// back as a fraction.
 		mesh_arrays[Mesh::ARRAY_CUSTOM1] = out_tex_attribs;
 		output.mesh_flags |= (RenderingServerEnums::ARRAY_CUSTOM_RG_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM1_SHIFT);
+	}
+	if (!out_timeline_attribs.is_empty()) {
+		// The geomorph timeline rides in CUSTOM2 (see out_timeline_attribs);
+		// the shader collapses each slot outside its window and lerps inside
+		// it. No blend shapes: the whole morph is evaluated in the material's
+		// vertex stage.
+		mesh_arrays[Mesh::ARRAY_CUSTOM2] = out_timeline_attribs;
+		output.mesh_flags |= (RenderingServerEnums::ARRAY_CUSTOM_RGBA_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM2_SHIFT);
 	}
 	mesh_arrays[Mesh::ARRAY_INDEX] = out_indices;
 	output.surfaces.push_back(surface);
@@ -1242,6 +1529,15 @@ bool VoxelMesherTetra::get_lod_transitions_enabled() const {
 	return _parameters.lod_transitions_enabled;
 }
 
+void VoxelMesherTetra::set_lod_geomorph_enabled(bool p_enabled) {
+	_parameters.lod_geomorph_enabled = p_enabled;
+	emit_changed();
+}
+
+bool VoxelMesherTetra::get_lod_geomorph_enabled() const {
+	return _parameters.lod_geomorph_enabled;
+}
+
 void VoxelMesherTetra::set_vertex_scale(float p_scale) {
 	_parameters.vertex_scale = MAX(0.0001f, p_scale);
 	emit_changed();
@@ -1337,6 +1633,8 @@ void VoxelMesherTetra::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("set_lod_transitions_enabled", "enabled"), &VoxelMesherTetra::set_lod_transitions_enabled);
 	ClassDB::bind_method(D_METHOD("get_lod_transitions_enabled"), &VoxelMesherTetra::get_lod_transitions_enabled);
+	ClassDB::bind_method(D_METHOD("set_lod_geomorph_enabled", "enabled"), &VoxelMesherTetra::set_lod_geomorph_enabled);
+	ClassDB::bind_method(D_METHOD("get_lod_geomorph_enabled"), &VoxelMesherTetra::get_lod_geomorph_enabled);
 
 	ClassDB::bind_method(D_METHOD("set_vertex_scale", "scale"), &VoxelMesherTetra::set_vertex_scale);
 	ClassDB::bind_method(D_METHOD("get_vertex_scale"), &VoxelMesherTetra::get_vertex_scale);
@@ -1378,6 +1676,7 @@ void VoxelMesherTetra::_bind_methods() {
 	ADD_PROPERTY(
 			PropertyInfo(Variant::BOOL, "generate_tangents"), "set_generate_tangents", "get_generate_tangents");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "lod_transitions_enabled"), "set_lod_transitions_enabled", "get_lod_transitions_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "lod_geomorph_enabled"), "set_lod_geomorph_enabled", "get_lod_geomorph_enabled");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "vertex_scale"), "set_vertex_scale", "get_vertex_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "vertex_offset"), "set_vertex_offset", "get_vertex_offset");
 	ADD_GROUP("Collision", "collision_");

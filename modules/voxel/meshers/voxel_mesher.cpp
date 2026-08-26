@@ -64,6 +64,7 @@ Ref<Mesh> VoxelMesher::build_mesh(
 
 	Ref<ArrayMesh> mesh;
 	mesh.instantiate();
+	bool blend_shapes_initialized = false;
 
 	int gd_surface_index = 0;
 	for (unsigned int i = 0; i < output.surfaces.size(); ++i) {
@@ -78,6 +79,16 @@ Ref<Mesh> VoxelMesher::build_mesh(
 		if (!is_surface_triangulated(arrays)) {
 			continue;
 		}
+		if (!blend_shapes_initialized) {
+			for (int shape_index = 0; shape_index < surface.blend_shapes.size(); ++shape_index) {
+				mesh->add_blend_shape(StringName("voxel_morph_" + itos(shape_index)));
+			}
+			if (!surface.blend_shapes.is_empty()) {
+				mesh->set_blend_shape_mode(Mesh::BLEND_SHAPE_MODE_NORMALIZED);
+			}
+			blend_shapes_initialized = true;
+		}
+		ERR_CONTINUE(mesh->get_blend_shape_count() != surface.blend_shapes.size());
 
 		Ref<Material> material;
 		if (int(surface.material_index) < materials.size()) {
@@ -87,7 +98,8 @@ Ref<Mesh> VoxelMesher::build_mesh(
 			material = get_material_by_index(surface.material_index);
 		}
 
-		mesh->add_surface_from_arrays(output.primitive_type, arrays, Array(), Dictionary(), output.mesh_flags);
+		mesh->add_surface_from_arrays(
+				output.primitive_type, arrays, surface.blend_shapes, Dictionary(), output.mesh_flags);
 		mesh->surface_set_material(gd_surface_index, material);
 		++gd_surface_index;
 	}

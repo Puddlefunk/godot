@@ -2,6 +2,7 @@
 #define VOXEL_MESH_BLOCK_VLT_H
 
 #include "../../util/godot/classes/shader_material.h"
+#include "core/math/vector4.h"
 #include "../../util/memory/memory.h"
 #include "../../util/tasks/time_spread_task_runner.h"
 #include "../voxel_mesh_block.h"
@@ -53,6 +54,13 @@ public:
 	void set_visible(bool visible);
 	bool update_fading(float speed);
 	void clear_fading();
+	// Geomorph timeline control (2026-08-23): the morph is evaluated in the
+	// material's vertex stage, driven by the u_morph_params uniform --
+	// x = mode (0 uniform weight, 1 camera-distance band), y = uniform
+	// weight, z/w = band inner/outer radius in WORLD units. Blend shapes are
+	// no longer involved.
+	void set_lod_morph(float weight);
+	void set_lod_morph_band(float inner_radius_world, float outer_radius_world);
 
 	void set_parent_visible(bool parent_visible);
 
@@ -128,7 +136,11 @@ private:
 		return _transition_mask & (1 << side);
 	}
 
+	void set_geomorph_params(const Vector4 &params);
+
 	Ref<ShaderMaterial> _shader_material;
+	// Last pushed u_morph_params; x < 0 means "not pushed yet".
+	Vector4 _geomorph_params = Vector4(-1.f, -1.f, -1.f, -1.f);
 
 	FixedArray<zylann::godot::DirectMeshInstance, Cube::SIDE_COUNT> _transition_mesh_instances;
 
@@ -150,7 +162,7 @@ bool is_mesh_empty(Span<const VoxelMesher::Output::Surface> surfaces);
 Ref<ArrayMesh> build_mesh(
 		Span<const VoxelMesher::Output::Surface> surfaces,
 		Mesh::PrimitiveType primitive,
-		int flags,
+		uint64_t flags,
 		Ref<Material> material
 );
 

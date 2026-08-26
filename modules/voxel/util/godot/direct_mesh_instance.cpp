@@ -101,6 +101,18 @@ void DirectMeshInstance::set_shader_instance_parameter(StringName key, Variant v
 	vs.instance_geometry_set_shader_parameter(_mesh_instance, key, value);
 }
 
+void DirectMeshInstance::set_blend_shape_weight(int shape_index, float weight) {
+	ERR_FAIL_COND(!_mesh_instance.is_valid());
+	RenderingServer::get_singleton()->instance_set_blend_shape_weight(_mesh_instance, shape_index, weight);
+}
+
+void DirectMeshInstance::set_blend_shape_spatial_weight(
+		bool enabled, const Vector3 &center, float inner_radius, float outer_radius) {
+	ERR_FAIL_COND(!_mesh_instance.is_valid());
+	RenderingServer::get_singleton()->instance_set_blend_shape_spatial_weight(
+			_mesh_instance, enabled, center, inner_radius, outer_radius);
+}
+
 Ref<Mesh> DirectMeshInstance::get_mesh() const {
 	return _mesh;
 }

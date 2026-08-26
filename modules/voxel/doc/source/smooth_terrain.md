@@ -530,6 +530,8 @@ This trick requires you to use a `ShaderMaterial` on `VoxelLodTerrain`, as the r
 
 `VoxelLodTerrain` has a property `lod_fade_duration`, expressed in seconds. By default it is `0`, which makes it inactive. Setting it to a small value like `0.25` will enable it.
 
+Setting `lod_fade_travel_distance` above `0` makes terrain and detail-texture fades advance with local viewer movement instead of elapsed time. `lod_fade_duration` still enables the feature. A travel-distance fade stops when the viewer stops.
+
 In your shader, add the following uniform:
 
 ```glsl

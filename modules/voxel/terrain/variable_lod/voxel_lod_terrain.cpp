@@ -767,6 +767,7 @@ void VoxelLodTerrain::set_lod_distance(float p_lod_distance) {
 			math::clamp(p_lod_distance, constants::MINIMUM_LOD_DISTANCE, constants::MAXIMUM_LOD_DISTANCE);
 	_update_data->settings.lod_distance = lod_distance;
 	_update_data->state.octree_streaming.force_update_octrees_next_update = true;
+	_lod_geomorph_force_update = true;
 	// VoxelEngine::get_singleton().set_volume_octree_lod_distance(_volume_id, get_lod_distance());
 
 #ifdef VOXEL_ENABLE_INSTANCER
@@ -793,6 +794,7 @@ void VoxelLodTerrain::set_secondary_lod_distance(float p_lod_distance) {
 			math::clamp(p_lod_distance, constants::MINIMUM_LOD_DISTANCE, constants::MAXIMUM_LOD_DISTANCE);
 	_update_data->settings.secondary_lod_distance = secondary_lod_distance;
 	_update_data->state.octree_streaming.force_update_octrees_next_update = true;
+	_lod_geomorph_force_update = true;
 	// VoxelEngine::get_singleton().set_volume_octree_lod_distance(_volume_id, get_lod_distance());
 
 #ifdef VOXEL_ENABLE_INSTANCER
@@ -847,6 +849,7 @@ void VoxelLodTerrain::_set_lod_count(int p_lod_count) {
 
 	_data->set_lod_count(p_lod_count);
 	_update_data->state.octree_streaming.force_update_octrees_next_update = true;
+	_lod_geomorph_force_update = true;
 
 	LodOctree::NoDestroyAction nda;
 
@@ -1291,7 +1294,66 @@ void VoxelLodTerrain::process(float delta) {
 	}
 
 	// Do it after we change mesh block states so materials are updated
+	process_lod_geomorph();
 	process_fading_blocks(delta);
+}
+
+void VoxelLodTerrain::process_lod_geomorph() {
+	if (!_lod_geomorph_enabled) {
+		return;
+	}
+	// The morph weight is computed PER-VERTEX in the material's vertex stage
+	// from the camera distance (see u_morph_params in the terrain shaders), so
+	// nothing here depends on the viewer anymore: this only pushes band
+	// parameters, and only when the configuration or the block population
+	// changed (_lod_geomorph_force_update is raised by both).
+	if (!_lod_geomorph_force_update) {
+		return;
+	}
+	_lod_geomorph_force_update = false;
+
+	FixedArray<float, constants::MAX_LOD> lod_distances;
+	get_lod_distances(to_span(lod_distances));
+	const unsigned int lod_count = get_lod_count();
+	const int base_mesh_block_size = get_mesh_block_size();
+	const bool legacy_octree =
+			_update_data->settings.streaming_system == VoxelLodTerrainUpdateData::STREAMING_SYSTEM_LEGACY_OCTREE;
+	// Band radii are pushed in WORLD units because the shader measures the
+	// camera distance in world space (uniform node scale assumed).
+	const float world_scale = get_global_transform().basis.get_scale().x;
+
+	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+		const float scale = static_cast<float>(1 << lod_index);
+		float outer_radius;
+		if (legacy_octree) {
+			// The octree merges/splits a whole parent octant the instant the
+			// distance from the viewer to the PARENT NODE CENTER crosses
+			// lod_distance * 2^(lod+1) (LodOctree::is_below_split_distance,
+			// with octree leaf == mesh block). Vertices of that octant lie up
+			// to half the parent node's diagonal from its center, so the
+			// per-vertex weight band must saturate that much earlier for
+			// every vertex to be fully morphed when the swap fires, in both
+			// directions.
+			const float parent_node_size = static_cast<float>(base_mesh_block_size) * scale * 2.f;
+			const float half_parent_diagonal = 0.8660254f * parent_node_size;
+			outer_radius = MAX(get_lod_distance() * scale * 2.f - half_parent_diagonal, 0.001f);
+		} else {
+			// Clipbox swaps are box-quantized per block rather than per parent
+			// octant; its band is left as-is until measured.
+			outer_radius = lod_distances[lod_index];
+		}
+		const float inner_radius = MAX(outer_radius - _lod_geomorph_distance * scale, 0.f);
+		const float inner_world = inner_radius * world_scale;
+		const float outer_world = MAX(outer_radius * world_scale, inner_world + 0.001f);
+
+		_mesh_maps_per_lod[lod_index].for_each_block([&](VoxelMeshBlockVLT &block) { //
+			if (lod_index + 1 >= lod_count) {
+				block.set_lod_morph(0.f);
+			} else {
+				block.set_lod_morph_band(inner_world, outer_world);
+			}
+		});
+	}
 }
 
 void VoxelLodTerrain::apply_main_thread_update_tasks() {
@@ -2061,6 +2123,12 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 				shadow_occluder_mode
 #endif
 		);
+		if (_lod_geomorph_enabled) {
+			block->set_lod_morph(0.f);
+			_lod_geomorph_force_update = true;
+		} else {
+			block->set_lod_morph(ob.lod == _lod_geomorph_debug_lod ? _lod_geomorph_debug_weight : 0.f);
+		}
 
 		if (assign_material_after_mesh) {
 			// Do this after assigning the mesh when not using a ShaderMaterial.
@@ -2400,7 +2468,21 @@ void VoxelLodTerrain::abort_async_edits() {
 void VoxelLodTerrain::process_fading_blocks(float delta) {
 	ZN_PROFILE_SCOPE();
 
-	const float speed = _lod_fade_duration < 0.001f ? 99999.f : delta / _lod_fade_duration;
+	const float time_speed = _lod_fade_duration < 0.001f ? 99999.f : delta / _lod_fade_duration;
+	float lod_speed = time_speed;
+	if (_lod_fade_duration > 0.001f && _lod_fade_travel_distance > 0.001f) {
+		const Vector3 viewer_position = get_local_viewer_pos();
+		if (_lod_fade_previous_viewer_position_valid) {
+			lod_speed = viewer_position.distance_to(_lod_fade_previous_viewer_position) /
+					_lod_fade_travel_distance;
+		} else {
+			lod_speed = 0.f;
+		}
+		_lod_fade_previous_viewer_position = viewer_position;
+		_lod_fade_previous_viewer_position_valid = true;
+	} else {
+		_lod_fade_previous_viewer_position_valid = false;
+	}
 
 	{
 		ZN_PROFILE_SCOPE();
@@ -2418,7 +2500,7 @@ void VoxelLodTerrain::process_fading_blocks(float delta) {
 					continue;
 				}
 
-				const bool finished = block->update_fading(speed);
+				const bool finished = block->update_fading(lod_speed);
 
 				if (finished) {
 					// `erase` returns the next iterator
@@ -2436,7 +2518,7 @@ void VoxelLodTerrain::process_fading_blocks(float delta) {
 		// ZN_PROFILE_PLOT("fading_out_meshes", int64_t(_fading_out_meshes.size()));
 		for (unsigned int i = 0; i < _fading_out_meshes.size();) {
 			FadingOutMesh &item = _fading_out_meshes[i];
-			item.progress -= speed;
+			item.progress -= lod_speed;
 			if (item.progress <= 0.f) {
 				FreeMeshTask::try_add_and_destroy(item.mesh_instance);
 				_shader_material_pool.recycle(item.shader_material);
@@ -2473,7 +2555,7 @@ void VoxelLodTerrain::process_fading_blocks(float delta) {
 					Ref<ShaderMaterial> sm = block->get_shader_material();
 
 					if (sm.is_valid()) {
-						item.progress = math::min(item.progress + speed, 1.f);
+						item.progress = math::min(item.progress + lod_speed, 1.f);
 						remove = item.progress >= 1.f;
 						sm->set_shader_parameter(
 								VoxelStringNames::get_singleton().u_voxel_virtual_texture_fade, item.progress
@@ -2760,12 +2842,88 @@ void VoxelLodTerrain::set_lod_fade_duration(float seconds) {
 			mesh_map.for_each_block([](VoxelMeshBlockVLT &mesh_block) { //
 				mesh_block.clear_fading();
 			});
+			_fading_blocks_per_lod[lod_index].clear();
 		}
+		_lod_fade_previous_viewer_position_valid = false;
 	}
 }
 
 float VoxelLodTerrain::get_lod_fade_duration() const {
 	return _lod_fade_duration;
+}
+
+void VoxelLodTerrain::set_lod_fade_travel_distance(float distance) {
+	_lod_fade_travel_distance = math::max(distance, 0.f);
+	_lod_fade_previous_viewer_position_valid = false;
+}
+
+float VoxelLodTerrain::get_lod_fade_travel_distance() const {
+	return _lod_fade_travel_distance;
+}
+
+void VoxelLodTerrain::set_lod_geomorph_debug_weight(float weight) {
+	_lod_geomorph_debug_weight = CLAMP(weight, 0.f, 1.f);
+	if (_lod_geomorph_enabled) {
+		return;
+	}
+	if (_lod_geomorph_debug_lod >= 0 && _lod_geomorph_debug_lod + 1 < get_lod_count()) {
+		_mesh_maps_per_lod[_lod_geomorph_debug_lod].for_each_block([this](VoxelMeshBlockVLT &block) { //
+			block.set_lod_morph(_lod_geomorph_debug_weight);
+		});
+	}
+}
+
+float VoxelLodTerrain::get_lod_geomorph_debug_weight() const {
+	return _lod_geomorph_debug_weight;
+}
+
+void VoxelLodTerrain::set_lod_geomorph_debug_lod(int lod_index) {
+	if (_lod_geomorph_enabled) {
+		_lod_geomorph_debug_lod = math::clamp(lod_index, 0, math::max(get_lod_count() - 2, 0));
+		return;
+	}
+	if (_lod_geomorph_debug_lod >= 0 && _lod_geomorph_debug_lod < get_lod_count()) {
+		_mesh_maps_per_lod[_lod_geomorph_debug_lod].for_each_block([](VoxelMeshBlockVLT &block) { //
+			block.set_lod_morph(0.f);
+		});
+	}
+	_lod_geomorph_debug_lod = math::clamp(lod_index, 0, math::max(get_lod_count() - 2, 0));
+	set_lod_geomorph_debug_weight(_lod_geomorph_debug_weight);
+}
+
+int VoxelLodTerrain::get_lod_geomorph_debug_lod() const {
+	return _lod_geomorph_debug_lod;
+}
+
+void VoxelLodTerrain::set_lod_geomorph_enabled(bool enabled) {
+	if (_lod_geomorph_enabled == enabled) {
+		return;
+	}
+	_lod_geomorph_enabled = enabled;
+	_lod_geomorph_previous_viewer_position_valid = false;
+	_lod_geomorph_force_update = enabled;
+	if (!enabled) {
+		const unsigned int lod_count = get_lod_count();
+		for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+			_mesh_maps_per_lod[lod_index].for_each_block([&, lod_index](VoxelMeshBlockVLT &block) { //
+				block.set_lod_morph(
+						static_cast<int>(lod_index) == _lod_geomorph_debug_lod ? _lod_geomorph_debug_weight : 0.f);
+			});
+		}
+	}
+}
+
+bool VoxelLodTerrain::get_lod_geomorph_enabled() const {
+	return _lod_geomorph_enabled;
+}
+
+void VoxelLodTerrain::set_lod_geomorph_distance(float distance) {
+	_lod_geomorph_distance = MAX(distance, 0.001f);
+	_lod_geomorph_force_update = true;
+}
+
+float VoxelLodTerrain::get_lod_geomorph_distance() const {
+	return _lod_geomorph_distance;
 }
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
@@ -3845,6 +4003,20 @@ void VoxelLodTerrain::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_lod_fade_duration"), &Self::get_lod_fade_duration);
 	ClassDB::bind_method(D_METHOD("set_lod_fade_duration", "seconds"), &Self::set_lod_fade_duration);
+	ClassDB::bind_method(D_METHOD("get_lod_fade_travel_distance"), &Self::get_lod_fade_travel_distance);
+	ClassDB::bind_method(
+			D_METHOD("set_lod_fade_travel_distance", "distance"), &Self::set_lod_fade_travel_distance
+	);
+	ClassDB::bind_method(
+			D_METHOD("set_lod_geomorph_debug_weight", "weight"), &Self::set_lod_geomorph_debug_weight);
+	ClassDB::bind_method(
+			D_METHOD("get_lod_geomorph_debug_weight"), &Self::get_lod_geomorph_debug_weight);
+	ClassDB::bind_method(D_METHOD("set_lod_geomorph_debug_lod", "lod_index"), &Self::set_lod_geomorph_debug_lod);
+	ClassDB::bind_method(D_METHOD("get_lod_geomorph_debug_lod"), &Self::get_lod_geomorph_debug_lod);
+	ClassDB::bind_method(D_METHOD("set_lod_geomorph_enabled", "enabled"), &Self::set_lod_geomorph_enabled);
+	ClassDB::bind_method(D_METHOD("get_lod_geomorph_enabled"), &Self::get_lod_geomorph_enabled);
+	ClassDB::bind_method(D_METHOD("set_lod_geomorph_distance", "distance"), &Self::set_lod_geomorph_distance);
+	ClassDB::bind_method(D_METHOD("get_lod_geomorph_distance"), &Self::get_lod_geomorph_distance);
 
 	ClassDB::bind_method(D_METHOD("set_lod_count", "lod_count"), &Self::set_lod_count);
 	ClassDB::bind_method(D_METHOD("get_lod_count"), &Self::get_lod_count);
@@ -4002,6 +4174,19 @@ void VoxelLodTerrain::_bind_methods() {
 			"get_secondary_lod_distance"
 	);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lod_fade_duration"), "set_lod_fade_duration", "get_lod_fade_duration");
+	ADD_PROPERTY(
+			PropertyInfo(Variant::FLOAT, "lod_fade_travel_distance", PROPERTY_HINT_RANGE, "0,1024,0.1,or_greater"),
+			"set_lod_fade_travel_distance",
+			"get_lod_fade_travel_distance"
+	);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lod_geomorph_debug_weight", PROPERTY_HINT_RANGE, "0,1,0.001"),
+			"set_lod_geomorph_debug_weight", "get_lod_geomorph_debug_weight");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "lod_geomorph_debug_lod", PROPERTY_HINT_RANGE, "0,7,1"),
+			"set_lod_geomorph_debug_lod", "get_lod_geomorph_debug_lod");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "lod_geomorph_enabled"),
+			"set_lod_geomorph_enabled", "get_lod_geomorph_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "lod_geomorph_distance", PROPERTY_HINT_RANGE, "0.001,1024,0.1,or_greater"),
+			"set_lod_geomorph_distance", "get_lod_geomorph_distance");
 
 	ADD_GROUP("Material", "");
 	ADD_PROPERTY(

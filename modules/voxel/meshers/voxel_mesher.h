@@ -51,12 +51,13 @@ public:
 		struct Surface {
 			Array arrays;
 			uint16_t material_index = 0;
+			TypedArray<Array> blend_shapes;
 		};
 		StdVector<Surface> surfaces;
 		FixedArray<StdVector<Surface>, Cube::SIDE_COUNT> transition_surfaces;
 		Mesh::PrimitiveType primitive_type = Mesh::PRIMITIVE_TRIANGLES;
 		// Flags for creating the Godot mesh resource
-		uint32_t mesh_flags = 0;
+		uint64_t mesh_flags = 0;
 
 		struct CollisionSurface {
 			StdVector<Vector3f> positions;

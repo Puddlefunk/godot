@@ -1038,7 +1038,7 @@ void VoxelLodTerrainUpdateTask::run(ThreadedTaskContext &ctx) {
 
 	state.stats.time_mesh_requests = profiling_clock.restart();
 
-	state.stats.time_total = profiling_clock.restart();
+	state.stats.time_total = profiling_clock_total.restart();
 }
 
 } // namespace zylann::voxel
