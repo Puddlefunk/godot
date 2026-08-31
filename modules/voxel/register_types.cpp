@@ -27,6 +27,7 @@
 #include "meshers/blocky/voxel_mesher_blocky.h"
 #include "meshers/cubes/voxel_mesher_cubes.h"
 #include "meshers/tetra/voxel_mesher_tetra.h"
+#include "meshers/tetra/voxel_shape_forge.h"
 #include "storage/metadata/voxel_metadata_factory.h"
 #include "storage/metadata/voxel_metadata_variant.h"
 #include "storage/voxel_buffer_gd.h"
@@ -328,6 +329,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<VoxelMesherBlocky>();
 		ClassDB::register_class<VoxelMesherCubes>();
 		ClassDB::register_class<VoxelMesherTetra>();
+		ClassDB::register_class<VoxelShapeForge>();
 
 		// See SCsub
 #ifdef VOXEL_ENABLE_FAST_NOISE_2
